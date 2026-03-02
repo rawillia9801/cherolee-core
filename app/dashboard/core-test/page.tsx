@@ -1,6 +1,23 @@
 "use client";
 
+/*
+CHANGELOG
+- FIX: Stop using res.json() directly (crashes if /api/ai/chat returns non-JSON or streams)
+- NEW: safeJson() helper (same behavior as core console)
+- NEW: Explicit Accept: application/json so the server knows we want JSON
+*/
+
 import { useState } from "react";
+
+async function safeJson(res: Response) {
+  const text = await res.text();
+  if (!text || !text.trim()) return { __empty: true, __text: "" };
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { __nonjson: true, __text: text.slice(0, 8000) };
+  }
+}
 
 export default function CoreTestPage() {
   const [threadId, setThreadId] = useState("");
@@ -13,7 +30,11 @@ export default function CoreTestPage() {
     try {
       const res = await fetch("/api/ai/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        cache: "no-store",
         body: JSON.stringify({
           thread_id: threadId || undefined,
           message,
@@ -21,11 +42,21 @@ export default function CoreTestPage() {
         }),
       });
 
-      const data = await res.json();
+      const data = await safeJson(res);
+
+      if (!res.ok) {
+        const msg =
+          (data && (data.error || data.message)) ||
+          (data?.__nonjson ? `Chat API did not return JSON:\n${data.__text}` : "") ||
+          (data?.__empty ? "Chat API returned an empty response." : "") ||
+          `Chat request failed (${res.status}).`;
+        throw new Error(msg);
+      }
+
       setLog(data);
-      if (data?.thread_id) setThreadId(data.thread_id);
+      if (data?.thread_id) setThreadId(String(data.thread_id));
     } catch (e: any) {
-      setLog({ error: e?.message ?? "Request failed" });
+      setLog({ ok: false, error: e?.message ?? "Request failed" });
     } finally {
       setLoading(false);
     }
@@ -35,7 +66,8 @@ export default function CoreTestPage() {
     <main className="min-h-screen bg-zinc-950 text-zinc-50 p-6">
       <h1 className="text-2xl font-semibold">Core API Test</h1>
       <p className="mt-2 text-sm text-zinc-300">
-        This page sends POST requests to <code className="text-zinc-100">/api/ai/chat</code>.
+        This page sends POST requests to{" "}
+        <code className="text-zinc-100">/api/ai/chat</code>.
       </p>
 
       <div className="mt-6 grid gap-3 max-w-2xl">

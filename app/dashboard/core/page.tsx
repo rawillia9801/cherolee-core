@@ -1,6 +1,25 @@
+// FILE: app/dashboard/core/page.tsx
+// CHEROLEE CORE — Full Console (Threads + Messages)
+//
+// CHANGELOG
+// - No localStorage.
+// - No auto-refresh loops.
+// - Eliminated URL replace “thrash” that can cause flicker.
+// - Proper AbortController cleanup + abort previous request when a new one starts.
+// - Stable selection logic: URL thread (optional) -> otherwise first thread.
+//
+// ANCHOR:ROUTES
+// - Threads:  /api/core/threads?limit=150&org_key=swva
+// - Messages: /api/core/messages?thread_id=...&limit=400
+// - Chat:     /api/ai/chat  (POST)
+//
+// ANCHOR:URLSTATE
+// - Optional: ?thread=<thread_id> (shareable)
+
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 
 type Thread = {
   id: string;
@@ -22,8 +41,6 @@ type Msg = {
   created_at: string;
   org_key: string;
 };
-
-const STORAGE_KEY = "cherolee_core_selected_thread";
 
 function cx(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -50,185 +67,49 @@ function shortId(id: string) {
   return `${id.slice(0, 8)}…${id.slice(-6)}`;
 }
 
+async function safeJson(res: Response) {
+  const text = await res.text();
+  if (!text || !text.trim()) return { __empty: true, __text: "" };
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { __nonjson: true, __text: text.slice(0, 5000) };
+  }
+}
+
 export default function CoreConsolePage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const ORG_KEY = "swva";
+
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string>("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [message, setMessage] = useState<string>("");
+
   const [loadingThreads, setLoadingThreads] = useState<boolean>(false);
   const [loadingMessages, setLoadingMessages] = useState<boolean>(false);
   const [sending, setSending] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  // UI state
   const [q, setQ] = useState("");
   const [onlyLinked, setOnlyLinked] = useState(false);
-  const [channelFilter, setChannelFilter] = useState<"all" | "dashboard" | "facebook" | "salesiq" | "other">("all");
+  const [channelFilter, setChannelFilter] =
+    useState<"all" | "dashboard" | "facebook" | "salesiq" | "other">("all");
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const mountedRef = useRef(true);
+
+  const threadsAbortRef = useRef<AbortController | null>(null);
+  const msgsAbortRef = useRef<AbortController | null>(null);
+
+  const urlThread = (searchParams.get("thread") ?? "").trim();
 
   const selectedThread = useMemo<Thread | null>(
     () => threads.find((t) => t.id === selectedThreadId) ?? null,
     [threads, selectedThreadId]
   );
-
-  function scrollToBottom() {
-    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-  }
-
-  function persistSelectedThread(id: string) {
-    try {
-      localStorage.setItem(STORAGE_KEY, id);
-    } catch {}
-  }
-
-  function readPersistedThread(): string {
-    try {
-      return localStorage.getItem(STORAGE_KEY) ?? "";
-    } catch {
-      return "";
-    }
-  }
-
-  async function loadThreads() {
-    setLoadingThreads(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/core/threads?limit=150&org_key=swva", { cache: "no-store" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "Failed to load threads");
-
-      const list: Thread[] = data.threads ?? [];
-      setThreads(list);
-
-      const saved = readPersistedThread();
-      const savedStillExists = saved && list.some((t) => t.id === saved);
-
-      if (!selectedThreadId) {
-        if (savedStillExists) {
-          setSelectedThreadId(saved);
-        } else if (list.length > 0) {
-          setSelectedThreadId(list[0].id);
-        }
-      }
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to load threads");
-    } finally {
-      setLoadingThreads(false);
-    }
-  }
-
-  async function loadMessages(threadId: string) {
-    if (!threadId) return;
-    setLoadingMessages(true);
-    setError(null);
-    try {
-      const res = await fetch(`/api/core/messages?thread_id=${encodeURIComponent(threadId)}&limit=400`, {
-        cache: "no-store",
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "Failed to load messages");
-
-      setMessages((data.messages ?? []) as Msg[]);
-      scrollToBottom();
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to load messages");
-    } finally {
-      setLoadingMessages(false);
-    }
-  }
-
-  async function createThreadAndSend(firstMessage: string) {
-    const res = await fetch("/api/ai/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: firstMessage,
-        channel: "dashboard",
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data?.error ?? "Failed to create thread");
-
-    const newThreadId = data.thread_id as string;
-    if (newThreadId) {
-      setSelectedThreadId(newThreadId);
-      persistSelectedThread(newThreadId);
-      await loadThreads();
-      await loadMessages(newThreadId);
-    }
-  }
-
-  async function send() {
-    const text = message.trim();
-    if (!text) return;
-
-    setSending(true);
-    setError(null);
-
-    try {
-      if (!selectedThreadId) {
-        setMessage("");
-        await createThreadAndSend(text);
-        return;
-      }
-
-      const optimisticId = `optimistic-${Date.now()}`;
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: optimisticId,
-          thread_id: selectedThreadId,
-          role: "user",
-          content: text,
-          meta: {},
-          created_at: new Date().toISOString(),
-          org_key: "swva",
-        },
-      ]);
-      setMessage("");
-      scrollToBottom();
-
-      const res = await fetch("/api/ai/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_id: selectedThreadId,
-          message: text,
-          channel: selectedThread?.channel ?? "dashboard",
-        }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "Chat failed");
-
-      await loadMessages(selectedThreadId);
-      await loadThreads();
-    } catch (e: any) {
-      setError(e?.message ?? "Send failed");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  useEffect(() => {
-    loadThreads();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (selectedThreadId) {
-      persistSelectedThread(selectedThreadId);
-      loadMessages(selectedThreadId);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedThreadId]);
-
-  function formatThreadTitle(t: Thread) {
-    const label = t.display_name?.trim() || "Conversation";
-    const channel = t.channel ? `· ${t.channel}` : "";
-    return `${label} ${channel}`;
-  }
 
   const channels = useMemo(() => {
     const set = new Set<string>();
@@ -264,14 +145,234 @@ export default function CoreConsolePage() {
     const total = messages.length;
     const userCount = messages.filter((m) => m.role === "user").length;
     const assistantCount = messages.filter((m) => m.role === "assistant").length;
-    const toolCount = messages.filter((m) => m.role === "tool").length;
-    const systemCount = messages.filter((m) => m.role === "system").length;
-
     const last = messages[messages.length - 1];
-    const lastPreview = last?.content?.trim()?.slice(0, 90) ?? "";
-
-    return { total, userCount, assistantCount, toolCount, systemCount, lastPreview };
+    const lastPreview = last?.content?.trim()?.slice(0, 120) ?? "";
+    return { total, userCount, assistantCount, lastPreview };
   }, [messages]);
+
+  function scrollToBottom() {
+    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+  }
+
+  const setThreadInUrl = useCallback(
+    (id: string) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (id) params.set("thread", id);
+      else params.delete("thread");
+      router.replace(`?${params.toString()}`);
+    },
+    [router, searchParams]
+  );
+
+  const loadThreads = useCallback(async () => {
+    // abort any in-flight
+    threadsAbortRef.current?.abort();
+    const ac = new AbortController();
+    threadsAbortRef.current = ac;
+
+    setLoadingThreads(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/core/threads?limit=150&org_key=${encodeURIComponent(ORG_KEY)}`, {
+        cache: "no-store",
+        signal: ac.signal,
+      });
+
+      const data = await safeJson(res);
+
+      if (!res.ok) {
+        const msg =
+          (data && (data.error || data.message)) ||
+          (data?.__nonjson ? `Threads API did not return JSON: ${data.__text}` : "") ||
+          (data?.__empty ? "Threads API returned an empty response." : "") ||
+          "Failed to load threads.";
+        throw new Error(msg);
+      }
+
+      const list: Thread[] = (data?.threads ?? []) as Thread[];
+      if (!mountedRef.current) return;
+
+      setThreads(list);
+
+      // selection:
+      // 1) urlThread if exists in list
+      // 2) keep previous if still exists
+      // 3) first item
+      setSelectedThreadId((prev) => {
+        if (urlThread && list.some((t) => t.id === urlThread)) return urlThread;
+        if (prev && list.some((t) => t.id === prev)) return prev;
+        return list.length ? list[0].id : "";
+      });
+
+      // normalize URL if empty and we have a default selection
+      if (!urlThread && list.length) {
+        setThreadInUrl(list[0].id);
+      }
+      if (urlThread && !list.some((t) => t.id === urlThread)) {
+        // urlThread invalid
+        setThreadInUrl(list.length ? list[0].id : "");
+      }
+    } catch (e: any) {
+      if (!mountedRef.current) return;
+      if (e?.name === "AbortError") return;
+      setError(e?.message ?? "Failed to load threads");
+    } finally {
+      if (mountedRef.current) setLoadingThreads(false);
+    }
+  }, [ORG_KEY, urlThread, setThreadInUrl]);
+
+  const loadMessages = useCallback(async (threadId: string) => {
+    if (!threadId) return;
+
+    // abort any in-flight
+    msgsAbortRef.current?.abort();
+    const ac = new AbortController();
+    msgsAbortRef.current = ac;
+
+    setLoadingMessages(true);
+    setError(null);
+
+    try {
+      const res = await fetch(
+        `/api/core/messages?thread_id=${encodeURIComponent(threadId)}&limit=400`,
+        { cache: "no-store", signal: ac.signal }
+      );
+
+      const data = await safeJson(res);
+
+      if (!res.ok) {
+        const msg =
+          (data && (data.error || data.message)) ||
+          (data?.__nonjson ? `Messages API did not return JSON: ${data.__text}` : "") ||
+          (data?.__empty ? "Messages API returned an empty response." : "") ||
+          "Failed to load messages.";
+        throw new Error(msg);
+      }
+
+      if (!mountedRef.current) return;
+      setMessages((data?.messages ?? []) as Msg[]);
+      scrollToBottom();
+    } catch (e: any) {
+      if (!mountedRef.current) return;
+      if (e?.name === "AbortError") return;
+      setError(e?.message ?? "Failed to load messages");
+    } finally {
+      if (mountedRef.current) setLoadingMessages(false);
+    }
+  }, []);
+
+  async function createThreadAndSend(firstMessage: string) {
+    const res = await fetch("/api/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        org_key: ORG_KEY,
+        message: firstMessage,
+        channel: "dashboard",
+      }),
+    });
+
+    const data = await safeJson(res);
+
+    if (!res.ok) {
+      const msg =
+        (data && (data.error || data.message)) ||
+        (data?.__nonjson ? `Chat API did not return JSON: ${data.__text}` : "") ||
+        (data?.__empty ? "Chat API returned an empty response." : "") ||
+        "Failed to create thread";
+      throw new Error(msg);
+    }
+
+    const newThreadId = (data?.thread_id ?? "") as string;
+    if (!newThreadId) throw new Error("Chat API did not return thread_id.");
+
+    setSelectedThreadId(newThreadId);
+    setThreadInUrl(newThreadId);
+
+    // refresh lists once
+    await loadThreads();
+    await loadMessages(newThreadId);
+  }
+
+  async function send() {
+    const text = message.trim();
+    if (!text || sending) return;
+
+    setSending(true);
+    setError(null);
+
+    try {
+      if (!selectedThreadId) {
+        setMessage("");
+        await createThreadAndSend(text);
+        return;
+      }
+
+      // optimistic
+      const optimisticId = `optimistic-${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: optimisticId,
+          thread_id: selectedThreadId,
+          role: "user",
+          content: text,
+          meta: {},
+          created_at: new Date().toISOString(),
+          org_key: ORG_KEY,
+        },
+      ]);
+      setMessage("");
+      scrollToBottom();
+
+      const res = await fetch("/api/ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({
+          org_key: ORG_KEY,
+          thread_id: selectedThreadId,
+          message: text,
+          channel: selectedThread?.channel ?? "dashboard",
+        }),
+      });
+
+      const data = await safeJson(res);
+
+      if (!res.ok) {
+        const msg =
+          (data && (data.error || data.message)) ||
+          (data?.__nonjson ? `Chat API did not return JSON: ${data.__text}` : "") ||
+          (data?.__empty ? "Chat API returned an empty response." : "") ||
+          "Chat failed";
+        throw new Error(msg);
+      }
+
+      // reload once after response
+      await loadMessages(selectedThreadId);
+      await loadThreads();
+    } catch (e: any) {
+      setError(e?.message ?? "Send failed");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function newConversation() {
+    setSelectedThreadId("");
+    setThreadInUrl("");
+    setMessages([]);
+    setMessage("");
+    setError(null);
+  }
+
+  function formatThreadTitle(t: Thread) {
+    const label = t.display_name?.trim() || "Conversation";
+    const channel = t.channel ? ` · ${t.channel}` : "";
+    return `${label}${channel}`;
+  }
 
   function RolePill({ role }: { role: Msg["role"] }) {
     const cls =
@@ -283,8 +384,32 @@ export default function CoreConsolePage() {
         ? "bg-amber-500/15 text-amber-200 border border-amber-500/20"
         : "bg-zinc-500/15 text-zinc-200 border border-zinc-500/20";
 
-    return <span className={cx("inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium", cls)}>{role}</span>;
+    return (
+      <span className={cx("inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium", cls)}>
+        {role}
+      </span>
+    );
   }
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    // initial load
+    loadThreads();
+
+    return () => {
+      mountedRef.current = false;
+      threadsAbortRef.current?.abort();
+      msgsAbortRef.current?.abort();
+    };
+  }, [loadThreads]);
+
+  // when thread selection changes -> set URL + load messages (single shot)
+  useEffect(() => {
+    if (!selectedThreadId) return;
+    setThreadInUrl(selectedThreadId);
+    loadMessages(selectedThreadId);
+  }, [selectedThreadId, loadMessages, setThreadInUrl]);
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-50">
@@ -297,19 +422,20 @@ export default function CoreConsolePage() {
         <div className="absolute inset-0 bg-gradient-to-b from-zinc-950/40 via-zinc-950 to-zinc-950" />
       </div>
 
-      <div className="relative mx-auto max-w-7xl px-4 py-6">
-        {/* Top header */}
-        <header className="sticky top-0 z-20 -mx-4 mb-4 bg-zinc-950/75 px-4 py-4 backdrop-blur-xl border-b border-white/10">
+      <div className="relative mx-auto max-w-[1400px] px-4 py-6">
+        <header className="sticky top-0 z-30 -mx-4 mb-4 border-b border-white/10 bg-zinc-950/75 px-4 py-4 backdrop-blur-xl">
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <div>
+            <div className="min-w-0">
               <div className="flex items-center gap-3">
                 <div className="h-10 w-10 rounded-2xl bg-white/10 border border-white/10 flex items-center justify-center">
                   <span className="text-sm font-semibold text-white/90">CC</span>
                 </div>
-                <div>
-                  <h1 className="text-xl md:text-2xl font-semibold tracking-tight">Cherolee Core Console</h1>
+                <div className="min-w-0">
+                  <h1 className="truncate text-xl md:text-2xl font-semibold tracking-tight">
+                    Cherolee Core Console
+                  </h1>
                   <p className="mt-0.5 text-xs md:text-sm text-zinc-300">
-                    Live sessions, message history, and direct conversation with Core.
+                    Full sessions + message history.
                   </p>
                 </div>
               </div>
@@ -318,11 +444,22 @@ export default function CoreConsolePage() {
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
               <div className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-3 py-2">
                 <span className="text-[11px] text-zinc-400">Org</span>
-                <span className="text-xs font-semibold text-zinc-100">swva</span>
+                <span className="text-xs font-semibold text-zinc-100">{ORG_KEY}</span>
                 <span className="mx-1 h-4 w-px bg-white/10" />
                 <span className="text-[11px] text-zinc-400">Threads</span>
                 <span className="text-xs font-semibold text-zinc-100">{threads.length}</span>
               </div>
+
+              <button
+                onClick={newConversation}
+                className={cx(
+                  "rounded-2xl px-4 py-2 text-sm font-semibold transition",
+                  "bg-black/40 border border-white/10 text-zinc-100 hover:bg-black/55"
+                )}
+                title="Start a new conversation"
+              >
+                New
+              </button>
 
               <button
                 onClick={loadThreads}
@@ -347,20 +484,19 @@ export default function CoreConsolePage() {
 
         <div className="grid grid-cols-12 gap-4">
           {/* Threads */}
-          <section className="col-span-12 md:col-span-4 rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden">
+          <section className="col-span-12 lg:col-span-4 rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden">
             <div className="border-b border-white/10 px-4 py-3">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-zinc-100">Sessions</h2>
                 <span className="text-xs text-zinc-400">{filteredThreads.length}</span>
               </div>
 
-              {/* Search + filters */}
               <div className="mt-3 space-y-2">
                 <div className="relative">
                   <input
                     value={q}
                     onChange={(e) => setQ(e.target.value)}
-                    placeholder="Search sessions (name, channel, id, external user)…"
+                    placeholder="Search (name, channel, id, external user)…"
                     className="w-full rounded-2xl border border-white/10 bg-black/40 px-4 py-2.5 text-sm outline-none focus:border-white/20"
                   />
                   {q ? (
@@ -369,6 +505,7 @@ export default function CoreConsolePage() {
                       className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg px-2 py-1 text-xs text-zinc-300 hover:bg-white/5"
                       aria-label="Clear search"
                       title="Clear"
+                      type="button"
                     >
                       ✕
                     </button>
@@ -390,9 +527,9 @@ export default function CoreConsolePage() {
                   </select>
 
                   {channels.length > 0 ? (
-                    <div className="hidden lg:flex items-center gap-2 text-[11px] text-zinc-400">
+                    <div className="hidden xl:flex items-center gap-2 text-[11px] text-zinc-400">
                       <span className="opacity-70">Detected:</span>
-                      <span className="truncate max-w-[200px]">{channels.join(", ")}</span>
+                      <span className="truncate max-w-[240px]">{channels.join(", ")}</span>
                     </div>
                   ) : null}
 
@@ -409,12 +546,12 @@ export default function CoreConsolePage() {
               </div>
             </div>
 
-            <div className="max-h-[70vh] overflow-auto">
+            <div className="max-h-[68vh] overflow-auto">
               {loadingThreads ? (
                 <div className="p-4 text-sm text-zinc-300">Loading sessions…</div>
               ) : filteredThreads.length === 0 ? (
                 <div className="p-4 text-sm text-zinc-300">
-                  No matching sessions. Adjust search/filters, or send a message to create one.
+                  No matching sessions. Adjust filters or click <span className="text-zinc-100 font-semibold">New</span>.
                 </div>
               ) : (
                 <ul className="divide-y divide-white/5">
@@ -428,37 +565,22 @@ export default function CoreConsolePage() {
                       <li key={t.id}>
                         <button
                           onClick={() => setSelectedThreadId(t.id)}
-                          className={cx(
-                            "w-full text-left px-4 py-3 transition relative",
-                            active ? "bg-white/10" : "hover:bg-white/5"
-                          )}
+                          className={cx("w-full text-left px-4 py-3 transition relative", active ? "bg-white/10" : "hover:bg-white/5")}
+                          type="button"
                         >
-                          {/* active bar */}
-                          <div
-                            className={cx(
-                              "absolute left-0 top-0 h-full w-1 transition",
-                              active ? "bg-cyan-400/70" : "bg-transparent"
-                            )}
-                          />
+                          <div className={cx("absolute left-0 top-0 h-full w-1 transition", active ? "bg-cyan-400/70" : "bg-transparent")} />
 
                           <div className="flex items-start gap-3">
-                            <div
-                              className={cx(
-                                "mt-0.5 h-10 w-10 rounded-2xl flex items-center justify-center shrink-0",
-                                "border border-white/10 bg-black/30"
-                              )}
-                            >
+                            <div className={cx("mt-0.5 h-10 w-10 rounded-2xl flex items-center justify-center shrink-0", "border border-white/10 bg-black/30")}>
                               <span className="text-xs font-semibold text-zinc-100">{chip}</span>
                             </div>
 
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
+                              <div className="flex flex-wrap items-center gap-2">
                                 <div className="truncate text-sm font-semibold text-zinc-100">{name}</div>
-
                                 <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-300">
                                   {t.channel || "unknown"}
                                 </span>
-
                                 {linked ? (
                                   <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-200">
                                     linked
@@ -471,7 +593,7 @@ export default function CoreConsolePage() {
                                 {t.buyer_id ? <span className="text-emerald-200/90">buyer</span> : null}
                                 {t.puppy_id ? <span className="text-emerald-200/90">puppy</span> : null}
                                 {t.external_user_id ? (
-                                  <span className="truncate max-w-[220px] text-zinc-400/90">ext: {t.external_user_id}</span>
+                                  <span className="truncate max-w-[240px] text-zinc-400/90">ext: {t.external_user_id}</span>
                                 ) : null}
                               </div>
 
@@ -490,33 +612,20 @@ export default function CoreConsolePage() {
           </section>
 
           {/* Messages */}
-          <section className="col-span-12 md:col-span-8 rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden flex flex-col">
-            {/* Conversation header */}
+          <section className="col-span-12 lg:col-span-8 rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden flex flex-col">
             <div className="border-b border-white/10 px-4 py-3">
               <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <div className="text-sm font-semibold text-zinc-100 truncate">
-                      {selectedThread ? formatThreadTitle(selectedThread) : "New conversation"}
+                      {selectedThread ? formatThreadTitle(selectedThread) : "New conversation (not yet saved)"}
                     </div>
-                    {selectedThread?.buyer_id ? (
-                      <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-200">
-                        buyer linked
-                      </span>
-                    ) : null}
-                    {selectedThread?.puppy_id ? (
-                      <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-200">
-                        puppy linked
-                      </span>
-                    ) : null}
                   </div>
-
                   <div className="mt-1 text-xs text-zinc-400 break-all">
-                    {selectedThreadId ? selectedThreadId : "No thread selected yet."}
+                    {selectedThreadId ? selectedThreadId : "Send a message to create a new thread."}
                   </div>
                 </div>
 
-                {/* Stats */}
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="rounded-2xl border border-white/10 bg-black/30 px-3 py-2">
                     <div className="text-[10px] text-zinc-400">Messages</div>
@@ -541,13 +650,13 @@ export default function CoreConsolePage() {
               ) : null}
             </div>
 
-            {/* Messages list */}
             <div className="flex-1 max-h-[62vh] overflow-auto px-4 py-4 space-y-3">
               {loadingMessages ? (
                 <div className="text-sm text-zinc-300">Loading messages…</div>
               ) : messages.length === 0 ? (
                 <div className="rounded-3xl border border-white/10 bg-black/20 p-6 text-sm text-zinc-300">
-                  No messages yet. Send one to begin.
+                  <div className="text-zinc-100 font-semibold">No messages yet.</div>
+                  <div className="mt-1">Type below and press <span className="text-zinc-100 font-semibold">Enter</span> to begin.</div>
                 </div>
               ) : (
                 messages.map((m) => {
@@ -564,15 +673,12 @@ export default function CoreConsolePage() {
 
                   return (
                     <div key={m.id} className={cx("flex", align)}>
-                      <div className={cx("max-w-[92%] md:max-w-[85%] rounded-3xl px-4 py-3 text-sm shadow-sm", bubble)}>
+                      <div className={cx("max-w-[94%] md:max-w-[85%] rounded-3xl px-4 py-3 text-sm shadow-sm", bubble)}>
                         <div className="flex items-center justify-between gap-3">
                           <RolePill role={m.role} />
                           <div className="text-[11px] opacity-70 whitespace-nowrap">{niceTime(m.created_at)}</div>
                         </div>
-
                         <div className="mt-2 whitespace-pre-wrap leading-relaxed">{m.content}</div>
-
-                        {/* Optional meta indicator */}
                         {m.meta ? (
                           <div className="mt-2 text-[11px] text-zinc-500/90">
                             <span className="opacity-70">id:</span> {shortId(m.id)}
@@ -586,7 +692,6 @@ export default function CoreConsolePage() {
               <div ref={bottomRef} />
             </div>
 
-            {/* Composer */}
             <div className="border-t border-white/10 p-4 bg-zinc-950/30">
               <div className="flex flex-col gap-2">
                 <div className="flex items-end gap-2">
@@ -616,6 +721,8 @@ export default function CoreConsolePage() {
                       "bg-white text-zinc-950 hover:bg-zinc-100",
                       "disabled:opacity-60 disabled:hover:bg-white"
                     )}
+                    title="Send (Enter)"
+                    type="button"
                   >
                     {sending ? "Sending…" : "Send"}
                   </button>
@@ -627,6 +734,7 @@ export default function CoreConsolePage() {
                     onClick={scrollToBottom}
                     className="rounded-2xl border border-white/10 bg-white/5 px-3 py-1.5 hover:bg-white/10 text-xs"
                     title="Jump to bottom"
+                    type="button"
                   >
                     Bottom ↓
                   </button>
@@ -636,10 +744,10 @@ export default function CoreConsolePage() {
           </section>
         </div>
 
-        {/* Footer micro text */}
         <div className="mt-5 text-center text-[11px] text-zinc-500">
-          Core Console · sessions are loaded from <span className="text-zinc-400">/api/core/threads</span> and messages from{" "}
-          <span className="text-zinc-400">/api/core/messages</span>
+          Core Console · sessions from <span className="text-zinc-400">/api/core/threads</span> · messages from{" "}
+          <span className="text-zinc-400">/api/core/messages</span> · chat via{" "}
+          <span className="text-zinc-400">/api/ai/chat</span>
         </div>
       </div>
     </main>

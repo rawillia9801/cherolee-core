@@ -1,11 +1,17 @@
 // FILE: lib/db/supabaseBrowser.ts
 import { createBrowserClient } from "@supabase/ssr";
 
+let browserClient: ReturnType<typeof createBrowserClient> | null = null;
+
 export function supabaseBrowser() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (browserClient) return browserClient;
 
-  if (!url || !anon) throw new Error("Missing NEXT_PUBLIC Supabase env vars.");
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-  return createBrowserClient(url, anon);
+  // Do NOT throw in browser runtime.
+  // If env is truly missing, Supabase itself will error cleanly.
+
+  browserClient = createBrowserClient(url, anon);
+  return browserClient;
 }

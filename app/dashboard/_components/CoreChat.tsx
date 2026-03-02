@@ -1,7 +1,11 @@
-// FILE: app/dashboard/_components/CoreChat.tsx
-// CHEROLEE CORE — Dashboard Core Chat Panel (Threads + Messages)
-
 "use client";
+
+/*
+CHANGELOG
+- FIX: Stop using res.json() directly (crashes if /api/ai/chat returns non-JSON or streams)
+- NEW: safeJson() helper + better error surfacing
+- NEW: Explicit Accept: application/json
+*/
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -13,6 +17,16 @@ type Msg = {
   created_at: string;
   meta?: any;
 };
+
+async function safeJson(res: Response) {
+  const text = await res.text();
+  if (!text || !text.trim()) return { __empty: true, __text: "" };
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { __nonjson: true, __text: text.slice(0, 8000) };
+  }
+}
 
 export default function CoreChat() {
   const [threadId, setThreadId] = useState<string>("");
@@ -31,10 +45,20 @@ export default function CoreChat() {
     try {
       const res = await fetch(`/api/core/messages?thread_id=${encodeURIComponent(tid)}&limit=200`, {
         method: "GET",
-        headers: { "content-type": "application/json" },
+        headers: { Accept: "application/json" },
+        cache: "no-store",
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "Failed to load messages.");
+
+      const data = await safeJson(res);
+      if (!res.ok) {
+        const msg =
+          (data && (data.error || data.message)) ||
+          (data?.__nonjson ? `Messages API did not return JSON:\n${data.__text}` : "") ||
+          (data?.__empty ? "Messages API returned an empty response." : "") ||
+          "Failed to load messages.";
+        throw new Error(msg);
+      }
+
       setMessages((data?.messages ?? []) as Msg[]);
       setStatus("Thread loaded.");
     } catch (e: any) {
@@ -78,7 +102,11 @@ export default function CoreChat() {
     try {
       const res = await fetch("/api/ai/chat", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        cache: "no-store",
         body: JSON.stringify({
           thread_id: threadId || null,
           message: text,
@@ -87,13 +115,21 @@ export default function CoreChat() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? "Chat request failed.");
+      const data = await safeJson(res);
+
+      if (!res.ok) {
+        const msg =
+          (data && (data.error || data.message)) ||
+          (data?.__nonjson ? `Chat API did not return JSON:\n${data.__text}` : "") ||
+          (data?.__empty ? "Chat API returned an empty response." : "") ||
+          "Chat request failed.";
+        throw new Error(msg);
+      }
 
       const newThreadId = String(data?.thread_id ?? "");
       if (newThreadId && newThreadId !== threadId) setThreadId(newThreadId);
 
-      // Reload from DB so the screen matches the canonical stored history
+      // Reload from DB so the screen matches canonical stored history
       if (newThreadId) {
         await loadMessages(newThreadId);
       } else if (threadId) {
@@ -101,7 +137,6 @@ export default function CoreChat() {
       }
     } catch (e: any) {
       setStatus(e?.message ?? "Failed to send.");
-      // show assistant error bubble
       setMessages((m) => [
         ...m,
         {
@@ -135,7 +170,6 @@ export default function CoreChat() {
         </button>
       </div>
 
-      {/* Thread id */}
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
         <div className="md:col-span-2">
           <div className="text-xs font-semibold tracking-wide text-zinc-500">THREAD ID</div>
@@ -151,7 +185,6 @@ export default function CoreChat() {
         </div>
       </div>
 
-      {/* Messages */}
       <div className="mt-5 h-[420px] overflow-y-auto rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
         {messages.length === 0 ? (
           <div className="text-sm text-zinc-500">No messages yet.</div>
@@ -177,7 +210,6 @@ export default function CoreChat() {
         )}
       </div>
 
-      {/* Composer */}
       <div className="mt-4 flex gap-3">
         <textarea
           value={input}

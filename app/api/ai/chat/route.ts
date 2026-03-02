@@ -1,11 +1,12 @@
 // FILE: app/api/ai/chat/route.ts
-// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction)
+// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction + Puppy Availability Tool)
 
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
 import type { ToolCall } from "@/lib/core/types";
 import { dispatchTool } from "@/lib/core/dispatchTool";
 import { applyFactsSafely, type FactExtractResult } from "@/lib/core/facts";
+import { listAvailablePuppies } from "@/lib/core/puppies";
 
 const CORE_OWNER_ID = process.env.CORE_OWNER_ID!;
 const ORG_KEY = "swva";
@@ -27,17 +28,12 @@ function assertEnv(name: string) {
 }
 
 function toAnthropicMessages(history: DbMsg[]) {
-  const filtered = history
+  return history
     .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => {
-      const role: "user" | "assistant" = m.role === "user" ? "user" : "assistant";
-      return {
-        role,
-        content: [{ type: "text" as const, text: String(m.content ?? "") }],
-      };
-    });
-
-  return filtered;
+    .map((m) => ({
+      role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+      content: [{ type: "text" as const, text: String(m.content ?? "") }],
+    }));
 }
 
 async function callAnthropicText(opts: {
@@ -115,13 +111,31 @@ async function callAnthropicJson(opts: {
         .trim()
     : "";
 
-  // Must be JSON only
   try {
     return JSON.parse(raw) as FactExtractResult;
-  } catch (e) {
+  } catch {
     console.error("Failed to parse JSON from Claude:", raw);
     return { facts: [] };
   }
+}
+
+function formatMoney(v: any) {
+  const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : Number(v ?? 0);
+  if (!Number.isFinite(n)) return "$0.00";
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+function looksLikePuppyAvailabilityQuestion(text: string) {
+  const s = text.trim().toLowerCase();
+  // Covers: "how many puppies are for sale", "available puppies", "list puppies for sale", "names and price"
+  return (
+    /\bhow many\b/.test(s) &&
+      (/\bpupp(y|ies)\b/.test(s) || /\bfor sale\b/.test(s) || /\bavailable\b/.test(s)) ||
+    /\bavailable puppies\b/.test(s) ||
+    /\bpuppies for sale\b/.test(s) ||
+    (/\blist\b/.test(s) && /\bpupp(y|ies)\b/.test(s)) ||
+    (/\bnames?\b/.test(s) && /\bprice\b/.test(s) && /\bpupp(y|ies)\b/.test(s))
+  );
 }
 
 export async function POST(req: Request) {
@@ -172,7 +186,63 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Failed to store message." }, { status: 500 });
   }
 
-  // 3) Load recent messages for memory
+  // 3) If this is the "how many puppies are for sale" question, answer from DB immediately
+  //    (This is the missing operational piece.)
+  if (looksLikePuppyAvailabilityQuestion(message)) {
+    try {
+      const pups = await listAvailablePuppies({ supabase, owner_id: CORE_OWNER_ID, org_key: ORG_KEY });
+
+      const count = pups.length;
+
+      const lines =
+        count === 0
+          ? "You currently have 0 puppies marked as **available**."
+          : [
+              `You currently have **${count}** puppies marked as **available**:`,
+              ...pups.map((p, i) => {
+                const nm = (p.name ?? "").trim() || `Puppy ${i + 1}`;
+                const sex = (p.sex ?? "").trim();
+                const color = (p.color ?? "").trim();
+                const bits = [sex && `(${sex})`, color && color].filter(Boolean).join(" ");
+                const label = bits ? `${nm} ${bits}` : nm;
+                return `• ${label} — ${formatMoney(p.price)}`;
+              }),
+            ].join("\n");
+
+      const reply = lines;
+
+      // store assistant reply
+      await supabase.from("chat_messages").insert({
+        thread_id,
+        role: "assistant",
+        content: reply,
+        meta: { tool_results: [], fact_apply: null, used_tool: "listAvailablePuppies" },
+        org_key: ORG_KEY,
+      });
+
+      return NextResponse.json({
+        thread_id,
+        reply,
+        tool_results: [],
+        fact_apply: null,
+      });
+    } catch (e: any) {
+      console.error("Puppy availability query failed:", e);
+      const reply = "I couldn’t pull the puppy list right now. If you want, I can still answer if you paste the names and prices.";
+
+      await supabase.from("chat_messages").insert({
+        thread_id,
+        role: "assistant",
+        content: reply,
+        meta: { error: e?.message ?? String(e) },
+        org_key: ORG_KEY,
+      });
+
+      return NextResponse.json({ thread_id, reply }, { status: 200 });
+    }
+  }
+
+  // 4) Load recent messages for memory
   const { data: recentMsgs, error: recentErr } = await supabase
     .from("chat_messages")
     .select("id, thread_id, role, content, meta, created_at, org_key")
@@ -184,7 +254,7 @@ export async function POST(req: Request) {
 
   const anthropicMessages = toAnthropicMessages((recentMsgs ?? []) as DbMsg[]);
 
-  // 4) (Optional) rule-based tool calls still supported
+  // 5) (Optional) rule-based tool calls still supported
   const toolCalls: ToolCall[] = [];
   if (message.toLowerCase().startsWith("test litter")) {
     toolCalls.push({
@@ -204,7 +274,7 @@ export async function POST(req: Request) {
   const tool_results: any[] = [];
   for (const call of toolCalls) tool_results.push(await dispatchTool(call));
 
-  // 5) Extract facts (JSON-only) and apply safely
+  // 6) Extract facts (JSON-only) and apply safely
   let fact_apply: any = null;
   try {
     const factSystem = `
@@ -241,7 +311,7 @@ JSON shape:
     fact_apply = { applied: [], skipped: [], thread_id };
   }
 
-  // 6) Normal assistant reply (human-friendly)
+  // 7) Normal assistant reply (human-friendly)
   const chatSystem = `
 You are "Cherolee Core" for SWVA Chihuahua / Chihuahua.Services.
 
@@ -268,7 +338,6 @@ Keep it tight and useful.
     const appliedCount = Array.isArray(fact_apply?.applied) ? fact_apply.applied.length : 0;
 
     if (appliedCount > 0) {
-      // Prepend a clean confirmation line
       const confirmations = fact_apply.applied
         .map((a: any) => {
           if (a.kind === "puppy_birth_weight_oz") {
@@ -287,7 +356,7 @@ Keep it tight and useful.
     reply = "I hit a temporary issue generating a response. Please try again.";
   }
 
-  // 7) Insert assistant reply with meta (tool + fact results)
+  // 8) Insert assistant reply with meta (tool + fact results)
   const { error: insertAsstErr } = await supabase.from("chat_messages").insert({
     thread_id,
     role: "assistant",
