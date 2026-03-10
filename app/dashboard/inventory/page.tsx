@@ -24,7 +24,7 @@ if (!supabaseUrl || !supabaseAnonKey) {
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // IMPORTANT: replace this with your real owner UUID
-const OWNER_ID = "REPLACE_WITH_YOUR_REAL_OWNER_ID";
+const OWNER_ID = "a9960a10-9972-4cba-bde1-4d95db611514";
 
 type InventoryItem = {
   id: string;
@@ -171,7 +171,7 @@ export default function InventoryPage() {
     setErrorMsg("");
     setSuccessMsg("");
 
-    if (!OWNER_ID || OWNER_ID === "REPLACE_WITH_YOUR_REAL_OWNER_ID") {
+    if (!OWNER_ID || OWNER_ID === "a9960a10-9972-4cba-bde1-4d95db611514") {
       setSaving(false);
       setErrorMsg("Replace OWNER_ID in the page with your real owner UUID.");
       return;
@@ -680,7 +680,7 @@ export default function InventoryPage() {
                 className="flex-1 py-3 rounded-2xl border border-white/10 hover:bg-white/5"
                 disabled={saving}
               >
-                Cancel
+                Cancel\
               </button>
               <button
                 type="submit"
