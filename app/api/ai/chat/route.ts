@@ -1,16 +1,3 @@
-// FILE: app/api/ai/chat/route.ts
-// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction + Puppy Ops + Inventory)
-//
-// CHANGELOG
-// - KEEP: thread creation validation + useful error reporting
-// - KEEP: add puppy + available puppies
-// - ADD: add inventory command router
-// - ADD: list inventory / what inventory do I have
-// - ADD: adjust inventory command router
-// - FIX: assistant prompt blocks fake function/tool markup
-// - FIX: if an operational action is not wired, assistant should say so plainly
-// - FIX: local route typing now supports inventory tool calls without breaking build
-
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
 import type { ToolCall } from "@/lib/core/types";
@@ -26,7 +13,7 @@ type DbMsg = {
   thread_id: string;
   role: "user" | "assistant" | "tool" | "system";
   content: string;
-  meta: any;
+  meta: unknown;
   created_at: string;
   org_key: string;
 };
@@ -38,6 +25,11 @@ type AddInventoryToolCall = {
     name: string;
     quantity: number | null;
     cost: number | null;
+    sku?: string | null;
+    category?: string | null;
+    supplier?: string | null;
+    sell_price?: number | null;
+    notes?: string | null;
   };
 };
 
@@ -55,9 +47,7 @@ type RouteToolCall = ToolCall | AddInventoryToolCall | AdjustInventoryToolCall;
 
 function getCoreOwnerId() {
   const id = process.env.CORE_OWNER_ID?.trim();
-  if (!id) {
-    throw new Error("Missing env var: CORE_OWNER_ID");
-  }
+  if (!id) throw new Error("Missing env var: CORE_OWNER_ID");
   return id;
 }
 
@@ -78,7 +68,10 @@ function toAnthropicMessages(history: DbMsg[]) {
 
 async function callAnthropicText(opts: {
   system: string;
-  messages: Array<{ role: "user" | "assistant"; content: Array<{ type: "text"; text: string }> }>;
+  messages: Array<{
+    role: "user" | "assistant";
+    content: Array<{ type: "text"; text: string }>;
+  }>;
 }) {
   const apiKey = assertEnv("ANTHROPIC_API_KEY");
 
@@ -118,7 +111,10 @@ async function callAnthropicText(opts: {
 
 async function callAnthropicJson(opts: {
   system: string;
-  messages: Array<{ role: "user" | "assistant"; content: Array<{ type: "text"; text: string }> }>;
+  messages: Array<{
+    role: "user" | "assistant";
+    content: Array<{ type: "text"; text: string }>;
+  }>;
 }) {
   const apiKey = assertEnv("ANTHROPIC_API_KEY");
 
@@ -190,17 +186,53 @@ function looksLikeInventoryListQuestion(text: string) {
     /\blist inventory\b/.test(s) ||
     /\bshow inventory\b/.test(s) ||
     /\bwhat do i have in inventory\b/.test(s) ||
+    /\binventory list\b/.test(s) ||
+    /\bshow me inventory\b/.test(s) ||
     (/\bhow many\b/.test(s) && /\binventory\b/.test(s))
+  );
+}
+
+function looksLikeInventoryCommand(text: string) {
+  const s = text.trim().toLowerCase();
+
+  return (
+    /\binventory\b/.test(s) ||
+    /\bsku\b/.test(s) ||
+    /\bquantity\b/.test(s) ||
+    /\bcost\b/.test(s) ||
+    /\bsell price\b/.test(s) ||
+    /\bsupplier\b/.test(s) ||
+    /\bcategory\b/.test(s) ||
+    /^\s*add\s+\d+\s+.+?\s+cost\s+\$?\d+(\.\d{1,2})?\s*(each)?\s*$/i.test(s) ||
+    /^\s*received\s+\d+\s+.+$/i.test(s) ||
+    /^\s*restocked?\s+\d+\s+.+$/i.test(s) ||
+    /^\s*subtract\s+\d+\s+.+$/i.test(s) ||
+    /^\s*remove\s+\d+\s+.+$/i.test(s)
+  );
+}
+
+function looksLikePuppyAddCommand(text: string) {
+  const s = text.trim().toLowerCase();
+
+  if (!s.startsWith("add")) return false;
+  if (looksLikeInventoryCommand(s)) return false;
+
+  return (
+    /\bpuppy\b/.test(s) ||
+    /\bpup\b/.test(s) ||
+    /^\s*add\s+puppy\b/.test(s) ||
+    /^\s*add\s+pup\b/.test(s)
   );
 }
 
 function parseAddPuppyCommand(text: string): { name: string } | null {
   const s = text.trim();
-  const m = s.match(/^\s*add\s+(?:puppy\s*)?:?\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,60})\s*$/i);
+
+  let m = s.match(/^\s*add\s+(?:puppy|pup)\s*:?\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,60})\s*$/i);
   if (m?.[1]) {
-    const name = m[1].trim();
-    if (name.length >= 1) return { name };
+    return { name: m[1].trim() };
   }
+
   return null;
 }
 
@@ -208,23 +240,15 @@ function parseAddInventoryCommand(text: string): {
   name: string;
   quantity: number | null;
   cost: number | null;
+  sku?: string | null;
+  category?: string | null;
+  supplier?: string | null;
+  sell_price?: number | null;
+  notes?: string | null;
 } | null {
   const s = text.trim();
 
-  // "add 100 bubble mailers cost 0.18 each"
   let m = s.match(
-    /^\s*add\s+(\d+)\s+(.+?)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:each)?\s*$/i
-  );
-  if (m) {
-    return {
-      quantity: Number(m[1]),
-      name: m[2].trim(),
-      cost: Number(m[3]),
-    };
-  }
-
-  // "add inventory puppy pads quantity 24 cost 8.99"
-  m = s.match(
     /^\s*add\s+inventory\s+(.+?)\s+quantity\s+(\d+)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*$/i
   );
   if (m) {
@@ -235,12 +259,55 @@ function parseAddInventoryCommand(text: string): {
     };
   }
 
-  // "add inventory puppy pads"
+  m = s.match(
+    /^\s*add\s+(\d+)\s+(.+?)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:each)?\s*$/i
+  );
+  if (m) {
+    return {
+      quantity: Number(m[1]),
+      name: m[2].trim(),
+      cost: Number(m[3]),
+    };
+  }
+
+  m = s.match(
+    /^\s*received\s+(\d+)\s+(.+?)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:each)?\s*$/i
+  );
+  if (m) {
+    return {
+      quantity: Number(m[1]),
+      name: m[2].trim(),
+      cost: Number(m[3]),
+      notes: "received via chat",
+    };
+  }
+
+  m = s.match(
+    /^\s*restocked?\s+(\d+)\s+(.+?)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:each)?\s*$/i
+  );
+  if (m) {
+    return {
+      quantity: Number(m[1]),
+      name: m[2].trim(),
+      cost: Number(m[3]),
+      notes: "restocked via chat",
+    };
+  }
+
   m = s.match(/^\s*add\s+inventory\s+(.+?)\s*$/i);
   if (m) {
     return {
       name: m[1].trim(),
       quantity: 0,
+      cost: 0,
+    };
+  }
+
+  m = s.match(/^\s*add\s+(.+?)\s+to\s+inventory\s*$/i);
+  if (m) {
+    return {
+      name: m[1].trim(),
+      quantity: 1,
       cost: 0,
     };
   }
@@ -255,15 +322,43 @@ function parseAdjustInventoryCommand(text: string): {
 } | null {
   const s = text.trim();
 
-  // "adjust inventory puppy pads -2 damaged"
-  const m = s.match(/^\s*adjust\s+inventory\s+(.+?)\s+([+-]?\d+)\s*(.*)$/i);
-  if (!m) return null;
+  let m = s.match(/^\s*adjust\s+inventory\s+(.+?)\s+([+-]?\d+)\s*(.*)$/i);
+  if (m) {
+    return {
+      name: m[1].trim(),
+      delta: Number(m[2]),
+      notes: m[3]?.trim() || undefined,
+    };
+  }
 
-  return {
-    name: m[1].trim(),
-    delta: Number(m[2]),
-    notes: m[3]?.trim() || undefined,
-  };
+  m = s.match(/^\s*subtract\s+(\d+)\s+(.+?)\s*(.*)$/i);
+  if (m) {
+    return {
+      name: m[2].trim(),
+      delta: -Number(m[1]),
+      notes: m[3]?.trim() || undefined,
+    };
+  }
+
+  m = s.match(/^\s*remove\s+(\d+)\s+(.+?)\s*(.*)$/i);
+  if (m) {
+    return {
+      name: m[2].trim(),
+      delta: -Number(m[1]),
+      notes: m[3]?.trim() || undefined,
+    };
+  }
+
+  m = s.match(/^\s*add\s+(\d+)\s+more\s+(.+?)\s*(.*)$/i);
+  if (m) {
+    return {
+      name: m[2].trim(),
+      delta: Number(m[1]),
+      notes: m[3]?.trim() || undefined,
+    };
+  }
+
+  return null;
 }
 
 async function createThreadWithFallbacks(opts: {
@@ -310,9 +405,7 @@ async function createThreadWithFallbacks(opts: {
       .select("id")
       .single();
 
-    if (!error && data?.id) {
-      return { id: data.id };
-    }
+    if (!error && data?.id) return { id: data.id };
 
     lastError = error;
     console.error("chat_threads insert attempt failed:", { payload, error });
@@ -343,7 +436,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply: "Tell me what you need." }, { status: 400 });
     }
 
-    // 1) Create thread if needed
     if (!thread_id) {
       try {
         const newThread = await createThreadWithFallbacks({
@@ -366,7 +458,6 @@ export async function POST(req: Request) {
       }
     }
 
-    // 2) Insert user message
     const { error: insertUserErr } = await supabase.from("chat_messages").insert({
       thread_id,
       role: "user",
@@ -383,57 +474,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3A) Add puppy
-    const addCmd = parseAddPuppyCommand(message);
-    if (addCmd) {
-      const toolCall: ToolCall = {
-        tool: "create_puppy",
-        args: {
-          org_key: ORG_KEY,
-          owner_id: CORE_OWNER_ID,
-          name: addCmd.name,
-          status: "available",
-        },
-      };
-
-      const toolResult = await dispatchAnyTool(toolCall);
-
-      const ok = !!(toolResult as any)?.ok;
-      const puppyId = (toolResult as any)?.data?.id ?? (toolResult as any)?.puppy?.id ?? null;
-
-      let reply = "";
-      if (ok && puppyId) {
-        reply = `Added **${addCmd.name}** to puppy records and marked as **available**. (id: ${puppyId})`;
-      } else {
-        const errMsg =
-          (toolResult as any)?.error ||
-          (toolResult as any)?.message ||
-          "Create puppy failed (no id returned).";
-        reply = `I could not add **${addCmd.name}**. ${errMsg}`;
-      }
-
-      await supabase.from("chat_messages").insert({
-        thread_id,
-        role: "assistant",
-        content: reply,
-        meta: {
-          used_tool: "create_puppy",
-          tool_calls: [toolCall],
-          tool_results: [toolResult],
-          proof: { ok, puppyId },
-        },
-        org_key: ORG_KEY,
-      });
-
-      return NextResponse.json({
-        thread_id,
-        reply,
-        tool_results: [toolResult],
-        fact_apply: null,
-      });
-    }
-
-    // 3B) Add inventory
+    // 3A) Add inventory FIRST
     const addInventoryCmd = parseAddInventoryCommand(message);
     if (addInventoryCmd) {
       const toolCall: AddInventoryToolCall = {
@@ -443,6 +484,11 @@ export async function POST(req: Request) {
           name: addInventoryCmd.name,
           quantity: addInventoryCmd.quantity,
           cost: addInventoryCmd.cost,
+          sku: addInventoryCmd.sku ?? null,
+          category: addInventoryCmd.category ?? null,
+          supplier: addInventoryCmd.supplier ?? null,
+          sell_price: addInventoryCmd.sell_price ?? null,
+          notes: addInventoryCmd.notes ?? null,
         },
       };
 
@@ -481,7 +527,7 @@ export async function POST(req: Request) {
       });
     }
 
-    // 3C) Adjust inventory
+    // 3B) Adjust inventory
     const adjustInventoryCmd = parseAdjustInventoryCommand(message);
     if (adjustInventoryCmd) {
       const toolCall: AdjustInventoryToolCall = {
@@ -518,6 +564,56 @@ export async function POST(req: Request) {
           used_tool: "adjust_inventory",
           tool_calls: [toolCall],
           tool_results: [toolResult],
+        },
+        org_key: ORG_KEY,
+      });
+
+      return NextResponse.json({
+        thread_id,
+        reply,
+        tool_results: [toolResult],
+        fact_apply: null,
+      });
+    }
+
+    // 3C) Puppy add AFTER inventory
+    const addCmd = looksLikePuppyAddCommand(message) ? parseAddPuppyCommand(message) : null;
+    if (addCmd) {
+      const toolCall: ToolCall = {
+        tool: "create_puppy",
+        args: {
+          org_key: ORG_KEY,
+          owner_id: CORE_OWNER_ID,
+          name: addCmd.name,
+          status: "available",
+        },
+      };
+
+      const toolResult = await dispatchAnyTool(toolCall);
+
+      const ok = !!(toolResult as any)?.ok;
+      const puppyId = (toolResult as any)?.data?.id ?? (toolResult as any)?.puppy?.id ?? null;
+
+      let reply = "";
+      if (ok && puppyId) {
+        reply = `Added **${addCmd.name}** to puppy records and marked as **available**. (id: ${puppyId})`;
+      } else {
+        const errMsg =
+          (toolResult as any)?.error ||
+          (toolResult as any)?.message ||
+          "Create puppy failed (no id returned).";
+        reply = `I could not add **${addCmd.name}**. ${errMsg}`;
+      }
+
+      await supabase.from("chat_messages").insert({
+        thread_id,
+        role: "assistant",
+        content: reply,
+        meta: {
+          used_tool: "create_puppy",
+          tool_calls: [toolCall],
+          tool_results: [toolResult],
+          proof: { ok, puppyId },
         },
         org_key: ORG_KEY,
       });
@@ -644,7 +740,6 @@ export async function POST(req: Request) {
       }
     }
 
-    // 4) Load recent messages for memory
     const { data: recentMsgs, error: recentErr } = await supabase
       .from("chat_messages")
       .select("id, thread_id, role, content, meta, created_at, org_key")
@@ -656,7 +751,6 @@ export async function POST(req: Request) {
 
     const anthropicMessages = toAnthropicMessages((recentMsgs ?? []) as DbMsg[]);
 
-    // 5) Optional rule-based tool calls
     const toolCalls: ToolCall[] = [];
     if (message.toLowerCase().startsWith("test litter")) {
       toolCalls.push({
@@ -676,7 +770,6 @@ export async function POST(req: Request) {
       tool_results.push(await dispatchAnyTool(call));
     }
 
-    // 6) Extract facts
     let fact_apply: any = null;
     try {
       const factSystem = `
@@ -713,7 +806,6 @@ JSON shape:
       fact_apply = { applied: [], skipped: [], thread_id };
     }
 
-    // 7) Normal assistant reply
     const chatSystem = `
 You are "Cherolee Core" for SWVA Chihuahua / Chihuahua.Services.
 
@@ -764,7 +856,6 @@ Keep it tight and useful.
       reply = "I hit a temporary issue generating a response. Please try again.";
     }
 
-    // 8) Insert assistant reply
     const { error: insertAsstErr } = await supabase.from("chat_messages").insert({
       thread_id,
       role: "assistant",
