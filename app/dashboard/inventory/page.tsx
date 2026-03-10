@@ -5,28 +5,22 @@ import { createClient } from "@supabase/supabase-js";
 import {
   Search,
   Plus,
-  RefreshCcw,
   Trash2,
   Edit3,
   X,
   Package,
   AlertTriangle,
-  CheckCircle2,
+  DollarSign,
 } from "lucide-react";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
-}
-
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
-// IMPORTANT: replace this with your real owner UUID
 const OWNER_ID = "a9960a10-9972-4cba-bde1-4d95db611514";
 
-type InventoryItem = {
+type Item = {
   id: string;
   owner_id: string;
   name: string;
@@ -38,11 +32,28 @@ type InventoryItem = {
   cost: number;
   sell_price: number;
   notes: string | null;
-  created_at: string;
-  updated_at: string;
+  created_at?: string;
 };
 
-type FormState = {
+type Sale = {
+  id: string;
+  inventory_id: string;
+  owner_id: string;
+  sold_at: string;
+  channel: string;
+  order_number: string;
+  customer_name: string;
+  quantity: number;
+  sale_price: number;
+  shipping_charged: number;
+  shipping_cost: number;
+  platform_fee: number;
+  other_fee: number;
+  notes: string;
+  created_at: string;
+};
+
+type ItemFormState = {
   name: string;
   sku: string;
   category: string;
@@ -54,7 +65,21 @@ type FormState = {
   notes: string;
 };
 
-const emptyForm: FormState = {
+type SaleFormState = {
+  sold_at: string;
+  channel: string;
+  order_number: string;
+  customer_name: string;
+  quantity: number;
+  sale_price: number;
+  shipping_charged: number;
+  shipping_cost: number;
+  platform_fee: number;
+  other_fee: number;
+  notes: string;
+};
+
+const blankItemForm: ItemFormState = {
   name: "",
   sku: "",
   category: "",
@@ -66,15 +91,29 @@ const emptyForm: FormState = {
   notes: "",
 };
 
-function money(value: number | null | undefined) {
-  return Number(value || 0).toLocaleString(undefined, {
+const blankSaleForm: SaleFormState = {
+  sold_at: new Date().toISOString().slice(0, 16),
+  channel: "",
+  order_number: "",
+  customer_name: "",
+  quantity: 1,
+  sale_price: 0,
+  shipping_charged: 0,
+  shipping_cost: 0,
+  platform_fee: 0,
+  other_fee: 0,
+  notes: "",
+};
+
+function money(v: number | null | undefined) {
+  return Number(v || 0).toLocaleString(undefined, {
     style: "currency",
     currency: "USD",
   });
 }
 
-function normalizeSku(value: string) {
-  return value.toUpperCase().replace(/\s+/g, "-").replace(/[^A-Z0-9-_]/g, "");
+function normalizeSku(v: string) {
+  return v.toUpperCase().replace(/\s+/g, "-").replace(/[^A-Z0-9-_]/g, "");
 }
 
 function StatCard({
@@ -100,23 +139,24 @@ function StatCard({
 }
 
 export default function InventoryPage() {
-  const [items, setItems] = useState<InventoryItem[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<InventoryItem | null>(null);
 
-  const [showModal, setShowModal] = useState(false);
+  const [showItemModal, setShowItemModal] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [form, setForm] = useState<FormState>(emptyForm);
-  const [saving, setSaving] = useState(false);
+  const [itemForm, setItemForm] = useState<ItemFormState>(blankItemForm);
+
+  const [selected, setSelected] = useState<Item | null>(null);
+  const [sales, setSales] = useState<Sale[]>([]);
+  const [salesLoading, setSalesLoading] = useState(false);
+  const [showSaleModal, setShowSaleModal] = useState(false);
+  const [saleForm, setSaleForm] = useState<SaleFormState>(blankSaleForm);
 
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
-  async function fetchInventory() {
-    setSyncing(true);
+  async function loadInventory() {
     setErrorMsg("");
 
     const { data, error } = await supabase
@@ -125,84 +165,92 @@ export default function InventoryPage() {
       .eq("owner_id", OWNER_ID)
       .order("created_at", { ascending: false });
 
-    if (error) {
-      setErrorMsg(error.message);
-    } else {
-      setItems((data || []) as InventoryItem[]);
-    }
+    if (error) setErrorMsg(error.message);
+    else setItems((data || []) as Item[]);
 
     setLoading(false);
-    setTimeout(() => setSyncing(false), 300);
+  }
+
+  async function loadSales(inventoryId: string) {
+    setSalesLoading(true);
+
+    const { data, error } = await supabase
+      .from("inventory_sales")
+      .select("*")
+      .eq("owner_id", OWNER_ID)
+      .eq("inventory_id", inventoryId)
+      .order("sold_at", { ascending: false });
+
+    if (error) {
+      setErrorMsg(error.message);
+      setSales([]);
+    } else {
+      setSales((data || []) as Sale[]);
+    }
+
+    setSalesLoading(false);
   }
 
   useEffect(() => {
-    fetchInventory();
+    loadInventory();
   }, []);
 
-  function openNewModal() {
+  async function selectItem(item: Item) {
+    setSelected(item);
+    await loadSales(item.id);
+  }
+
+  function openNewItem() {
     setEditingId(null);
-    setForm(emptyForm);
-    setErrorMsg("");
-    setSuccessMsg("");
-    setShowModal(true);
+    setItemForm(blankItemForm);
+    setShowItemModal(true);
   }
 
-  function openEditModal(item: InventoryItem) {
+  function openEditItem(item: Item) {
     setEditingId(item.id);
-    setForm({
-      name: item.name ?? "",
-      sku: item.sku ?? "",
-      category: item.category ?? "",
-      supplier: item.supplier ?? "",
-      quantity: Number(item.quantity || 0),
-      reorder_level: Number(item.reorder_level || 0),
-      cost: Number(item.cost || 0),
-      sell_price: Number(item.sell_price || 0),
-      notes: item.notes ?? "",
+    setItemForm({
+      name: item.name,
+      sku: item.sku,
+      category: item.category || "",
+      supplier: item.supplier || "",
+      quantity: item.quantity,
+      reorder_level: item.reorder_level,
+      cost: item.cost,
+      sell_price: item.sell_price,
+      notes: item.notes || "",
     });
-    setErrorMsg("");
-    setSuccessMsg("");
-    setShowModal(true);
+    setShowItemModal(true);
   }
 
-  async function handleSave(e: React.FormEvent) {
+  async function saveItem(e: React.FormEvent) {
     e.preventDefault();
-    setSaving(true);
     setErrorMsg("");
     setSuccessMsg("");
 
-    if (!OWNER_ID || OWNER_ID === "a9960a10-9972-4cba-bde1-4d95db611514") {
-      setSaving(false);
-      setErrorMsg("Replace OWNER_ID in the page with your real owner UUID.");
+    if (!itemForm.name.trim()) {
+      setErrorMsg("Name required");
       return;
     }
 
-    if (!form.name.trim()) {
-      setSaving(false);
-      setErrorMsg("Name is required.");
-      return;
-    }
-
-    if (!form.sku.trim()) {
-      setSaving(false);
-      setErrorMsg("SKU is required.");
+    if (!itemForm.sku.trim()) {
+      setErrorMsg("SKU required");
       return;
     }
 
     const payload = {
       owner_id: OWNER_ID,
-      name: form.name.trim(),
-      sku: normalizeSku(form.sku),
-      category: form.category.trim(),
-      supplier: form.supplier.trim(),
-      quantity: Math.max(0, Number(form.quantity || 0)),
-      reorder_level: Math.max(0, Number(form.reorder_level || 0)),
-      cost: Number(form.cost || 0),
-      sell_price: Number(form.sell_price || 0),
-      notes: form.notes.trim(),
+      name: itemForm.name.trim(),
+      sku: normalizeSku(itemForm.sku),
+      category: itemForm.category.trim(),
+      supplier: itemForm.supplier.trim(),
+      quantity: Number(itemForm.quantity || 0),
+      reorder_level: Number(itemForm.reorder_level || 0),
+      cost: Number(itemForm.cost || 0),
+      sell_price: Number(itemForm.sell_price || 0),
+      notes: itemForm.notes.trim(),
     };
 
-    let error;
+    let error: any;
 
     if (editingId) {
       ({ error } = await supabase.from("inventory").update(payload).eq("id", editingId));
@@ -210,26 +258,20 @@ export default function InventoryPage() {
       ({ error } = await supabase.from("inventory").insert([payload]));
     }
 
-    setSaving(false);
-
     if (error) {
       setErrorMsg(error.message);
       return;
     }
 
-    setSuccessMsg(editingId ? "Item updated." : "Item created.");
-    setShowModal(false);
+    setShowItemModal(false);
     setEditingId(null);
-    setForm(emptyForm);
-    await fetchInventory();
+    setItemForm(blankItemForm);
+    setSuccessMsg(editingId ? "Item updated." : "Item added.");
+    await loadInventory();
   }
 
-  async function handleDelete(id: string) {
-    const ok = window.confirm("Delete this inventory item?");
-    if (!ok) return;
-
-    setErrorMsg("");
-    setSuccessMsg("");
+  async function removeItem(id: string) {
+    if (!confirm("Delete this item?")) return;
 
     const { error } = await supabase.from("inventory").delete().eq("id", id);
 
@@ -238,17 +280,21 @@ export default function InventoryPage() {
       return;
     }
 
-    if (selected?.id === id) setSelected(null);
+    if (selected?.id === id) {
+      setSelected(null);
+      setSales([]);
+    }
+
     setSuccessMsg("Item deleted.");
-    await fetchInventory();
+    await loadInventory();
   }
 
-  async function adjustQuantity(item: InventoryItem, delta: number) {
-    const nextQty = Math.max(0, Number(item.quantity || 0) + delta);
+  async function adjustQuantity(item: Item, delta: number) {
+    const next = Math.max(0, Number(item.quantity || 0) + delta);
 
     const { error } = await supabase
       .from("inventory")
-      .update({ quantity: nextQty })
+      .update({ quantity: next })
       .eq("id", item.id);
 
     if (error) {
@@ -256,291 +302,260 @@ export default function InventoryPage() {
       return;
     }
 
-    await fetchInventory();
-
+    await loadInventory();
     if (selected?.id === item.id) {
-      setSelected({ ...item, quantity: nextQty });
+      const updated = { ...item, quantity: next };
+      setSelected(updated);
     }
   }
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
+  function openSaleModal() {
+    if (!selected) return;
 
-    if (!q) return items;
-
-    return items.filter((item) => {
-      return (
-        item.name?.toLowerCase().includes(q) ||
-        item.sku?.toLowerCase().includes(q) ||
-        item.category?.toLowerCase().includes(q) ||
-        item.supplier?.toLowerCase().includes(q)
-      );
+    setSaleForm({
+      ...blankSaleForm,
+      channel: "",
+      quantity: 1,
+      sale_price: Number(selected.sell_price || 0),
     });
+
+    setShowSaleModal(true);
+  }
+
+  async function saveSale(e: React.FormEvent) {
+    e.preventDefault();
+    setErrorMsg("");
+    setSuccessMsg("");
+
+    if (!selected) {
+      setErrorMsg("No inventory item selected.");
+      return;
+    }
+
+    if (!saleForm.channel.trim()) {
+      setErrorMsg("Sales channel is required.");
+      return;
+    }
+
+    const qty = Math.max(1, Number(saleForm.quantity || 1));
+    const currentQty = Number(selected.quantity || 0);
+
+    if (qty > currentQty) {
+      setErrorMsg("Sale quantity is greater than inventory on hand.");
+      return;
+    }
+
+    const salePayload = {
+      inventory_id: selected.id,
+      owner_id: OWNER_ID,
+      sold_at: new Date(saleForm.sold_at).toISOString(),
+      channel: saleForm.channel.trim(),
+      order_number: saleForm.order_number.trim(),
+      customer_name: saleForm.customer_name.trim(),
+      quantity: qty,
+      sale_price: Number(saleForm.sale_price || 0),
+      shipping_charged: Number(saleForm.shipping_charged || 0),
+      shipping_cost: Number(saleForm.shipping_cost || 0),
+      platform_fee: Number(saleForm.platform_fee || 0),
+      other_fee: Number(saleForm.other_fee || 0),
+      notes: saleForm.notes.trim(),
+    };
+
+    const { error: saleError } = await supabase.from("inventory_sales").insert([salePayload]);
+
+    if (saleError) {
+      setErrorMsg(saleError.message);
+      return;
+    }
+
+    const newQty = currentQty - qty;
+
+    const { error: invError } = await supabase
+      .from("inventory")
+      .update({ quantity: newQty })
+      .eq("id", selected.id);
+
+    if (invError) {
+      setErrorMsg(invError.message);
+      return;
+    }
+
+    const updatedSelected = { ...selected, quantity: newQty };
+    setSelected(updatedSelected);
+    setShowSaleModal(false);
+    setSaleForm(blankSaleForm);
+    setSuccessMsg("Sale recorded.");
+    await loadInventory();
+    await loadSales(selected.id);
+  }
+
+  async function removeSale(saleId: string) {
+    if (!selected) return;
+    if (!confirm("Delete this sale record?")) return;
+
+    const sale = sales.find((s) => s.id === saleId);
+    if (!sale) return;
+
+    const { error: deleteErr } = await supabase
+      .from("inventory_sales")
+      .delete()
+      .eq("id", saleId);
+
+    if (deleteErr) {
+      setErrorMsg(deleteErr.message);
+      return;
+    }
+
+    const restoredQty = Number(selected.quantity || 0) + Number(sale.quantity || 0);
+
+    const { error: invErr } = await supabase
+      .from("inventory")
+      .update({ quantity: restoredQty })
+      .eq("id", selected.id);
+
+    if (invErr) {
+      setErrorMsg(invErr.message);
+      return;
+    }
+
+    const updatedSelected = { ...selected, quantity: restoredQty };
+    setSelected(updatedSelected);
+    setSuccessMsg("Sale deleted and quantity restored.");
+    await loadInventory();
+    await loadSales(selected.id);
+  }
+
+  const filtered = useMemo(() => {
+    if (!query) return items;
+    const q = query.toLowerCase();
+
+    return items.filter((i) =>
+      i.name?.toLowerCase().includes(q) ||
+      i.sku?.toLowerCase().includes(q) ||
+      i.category?.toLowerCase().includes(q) ||
+      i.supplier?.toLowerCase().includes(q)
+    );
   }, [items, query]);
 
   const stats = useMemo(() => {
-    const totalItems = items.length;
-    const lowStock = items.filter(
-      (i) => Number(i.quantity || 0) > 0 && Number(i.quantity || 0) <= Number(i.reorder_level || 0)
-    ).length;
-    const outOfStock = items.filter((i) => Number(i.quantity || 0) === 0).length;
-    const inventoryValue = items.reduce(
-      (sum, i) => sum + Number(i.quantity || 0) * Number(i.cost || 0),
-      0
-    );
-
     return {
-      totalItems,
-      lowStock,
-      outOfStock,
-      inventoryValue,
+      total: items.length,
+      low: items.filter((i) => i.quantity <= i.reorder_level && i.quantity > 0).length,
+      out: items.filter((i) => i.quantity === 0).length,
+      value: items.reduce((s, i) => s + Number(i.quantity || 0) * Number(i.cost || 0), 0),
     };
   }, [items]);
 
+  const selectedSalesSummary = useMemo(() => {
+    const gross = sales.reduce(
+      (sum, s) => sum + Number(s.sale_price || 0) + Number(s.shipping_charged || 0),
+      0
+    );
+
+    const shipping = sales.reduce((sum, s) => sum + Number(s.shipping_cost || 0), 0);
+    const fees = sales.reduce(
+      (sum, s) => sum + Number(s.platform_fee || 0) + Number(s.other_fee || 0),
+      0
+    );
+
+    const cogs = sales.reduce((sum, s) => {
+      const unitCost = Number(selected?.cost || 0);
+      return sum + unitCost * Number(s.quantity || 0);
+    }, 0);
+
+    const net = gross - shipping - fees - cogs;
+
+    return { gross, shipping, fees, cogs, net };
+  }, [sales, selected]);
+
   return (
-    <div className="min-h-screen bg-black text-white">
-      <div className="border-b border-white/5 bg-zinc-900/40 backdrop-blur-md">
-        <div className="max-w-[1600px] mx-auto px-8 py-3 flex items-center justify-between text-xs font-semibold uppercase tracking-widest">
-          <div className="flex items-center gap-3 text-emerald-400">
-            <div className={`w-2 h-2 rounded-full bg-emerald-400 ${syncing ? "animate-ping" : ""}`} />
-            Inventory Synced
-          </div>
-          <button
-            onClick={fetchInventory}
-            className="flex items-center gap-2 hover:text-white transition-colors"
-            type="button"
-          >
-            <RefreshCcw size={14} className={syncing ? "animate-spin" : ""} />
-            Refresh
-          </button>
-        </div>
+    <div className="min-h-screen bg-black text-white p-10">
+      <div className="flex justify-between mb-8">
+        <h1 className="text-4xl font-bold">Inventory</h1>
+        <button onClick={openNewItem} className="bg-indigo-600 px-5 py-3 rounded-xl flex gap-2">
+          <Plus size={18} /> Add Item
+        </button>
       </div>
 
-      <main className="max-w-[1600px] mx-auto px-8 py-10">
-        <div className="flex items-center justify-between gap-6 mb-10">
-          <div>
-            <h1 className="text-4xl font-bold tracking-tight">Inventory</h1>
-            <p className="text-zinc-400 mt-2">
-              Real inventory manager with add, edit, delete, search, SKU, and quantity updates.
-            </p>
-          </div>
-
-          <button
-            onClick={openNewModal}
-            className="bg-indigo-600 hover:bg-indigo-500 px-6 py-3 rounded-2xl font-semibold flex items-center gap-2"
-            type="button"
-          >
-            <Plus size={18} />
-            New Item
-          </button>
-        </div>
-
-        {(errorMsg || successMsg) && (
-          <div className="mb-6 space-y-3">
-            {errorMsg && (
-              <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-rose-300">
-                {errorMsg}
-              </div>
-            )}
-            {successMsg && (
-              <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-emerald-300">
-                {successMsg}
-              </div>
-            )}
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-10">
-          <StatCard title="Items" value={stats.totalItems} icon={<Package size={20} />} />
-          <StatCard title="Low Stock" value={stats.lowStock} icon={<AlertTriangle size={20} />} />
-          <StatCard title="Out of Stock" value={stats.outOfStock} icon={<X size={20} />} />
-          <StatCard title="Inventory Value" value={money(stats.inventoryValue)} icon={<CheckCircle2 size={20} />} />
-        </div>
-
-        <div className="relative mb-8 max-w-xl">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-600" size={18} />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search by name, SKU, category, supplier..."
-            className="w-full bg-zinc-900/50 border border-white/10 rounded-2xl py-3 pl-12 pr-4 text-sm outline-none focus:border-indigo-500"
-          />
-        </div>
-
-        <div className="bg-zinc-900/40 border border-white/10 rounded-3xl overflow-hidden">
-          <table className="w-full text-left">
-            <thead className="bg-white/5 text-xs uppercase tracking-widest text-zinc-400">
-              <tr>
-                <th className="px-6 py-4">Name</th>
-                <th className="px-6 py-4">SKU</th>
-                <th className="px-6 py-4">Category</th>
-                <th className="px-6 py-4">Qty</th>
-                <th className="px-6 py-4">Reorder</th>
-                <th className="px-6 py-4">Unit Cost</th>
-                <th className="px-6 py-4">Sell Price</th>
-                <th className="px-6 py-4">Supplier</th>
-                <th className="px-6 py-4 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/5">
-              {loading ? (
-                <tr>
-                  <td className="px-6 py-6 text-zinc-400" colSpan={9}>
-                    Loading inventory...
-                  </td>
-                </tr>
-              ) : filtered.length === 0 ? (
-                <tr>
-                  <td className="px-6 py-6 text-zinc-400" colSpan={9}>
-                    No inventory items found.
-                  </td>
-                </tr>
-              ) : (
-                filtered.map((item) => {
-                  const low = Number(item.quantity || 0) <= Number(item.reorder_level || 0);
-
-                  return (
-                    <tr
-                      key={item.id}
-                      className="hover:bg-white/[0.02] cursor-pointer"
-                      onClick={() => setSelected(item)}
-                    >
-                      <td className="px-6 py-5 font-semibold text-white">{item.name}</td>
-                      <td className="px-6 py-5 font-mono text-zinc-300">{item.sku}</td>
-                      <td className="px-6 py-5 text-zinc-300">{item.category || "-"}</td>
-                      <td className={`px-6 py-5 font-semibold ${low ? "text-amber-400" : "text-white"}`}>
-                        {item.quantity}
-                      </td>
-                      <td className="px-6 py-5 text-zinc-300">{item.reorder_level}</td>
-                      <td className="px-6 py-5 text-zinc-300">{money(item.cost)}</td>
-                      <td className="px-6 py-5 text-zinc-300">{money(item.sell_price)}</td>
-                      <td className="px-6 py-5 text-zinc-300">{item.supplier || "-"}</td>
-                      <td className="px-6 py-5">
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openEditModal(item);
-                            }}
-                            className="p-2 rounded-xl hover:bg-white/5"
-                          >
-                            <Edit3 size={16} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDelete(item.id);
-                            }}
-                            className="p-2 rounded-xl hover:bg-rose-500/10 hover:text-rose-400"
-                          >
-                            <Trash2 size={16} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </main>
-
-      {selected && (
-        <div className="fixed inset-y-0 right-0 w-full max-w-md bg-zinc-950 border-l border-white/10 z-50 p-8 overflow-y-auto">
-          <div className="flex items-center justify-between mb-8">
-            <h2 className="text-2xl font-bold">Item Details</h2>
-            <button
-              onClick={() => setSelected(null)}
-              className="p-2 rounded-xl hover:bg-white/5"
-              type="button"
-            >
-              <X size={22} />
-            </button>
-          </div>
-
-          <div className="space-y-6">
-            <div>
-              <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Name</div>
-              <div className="text-xl font-semibold">{selected.name}</div>
-            </div>
-
-            <div>
-              <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">SKU</div>
-              <div className="font-mono text-lg">{selected.sku}</div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Quantity</div>
-                <div className="text-3xl font-bold">{selected.quantity}</div>
-              </div>
-              <div>
-                <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Reorder Level</div>
-                <div className="text-3xl font-bold">{selected.reorder_level}</div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Unit Cost</div>
-                <div className="text-xl font-semibold">{money(selected.cost)}</div>
-              </div>
-              <div>
-                <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Sell Price</div>
-                <div className="text-xl font-semibold">{money(selected.sell_price)}</div>
-              </div>
-            </div>
-
-            <div>
-              <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Category</div>
-              <div className="text-zinc-300">{selected.category || "-"}</div>
-            </div>
-
-            <div>
-              <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Supplier</div>
-              <div className="text-zinc-300">{selected.supplier || "-"}</div>
-            </div>
-
-            <div>
-              <div className="text-xs uppercase tracking-widest text-zinc-500 mb-1">Notes</div>
-              <div className="text-zinc-300 whitespace-pre-wrap">{selected.notes || "-"}</div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4 pt-4">
-              <button
-                type="button"
-                onClick={() => adjustQuantity(selected, 1)}
-                className="py-3 rounded-2xl bg-white text-black font-semibold hover:bg-zinc-200"
-              >
-                +1 Quantity
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustQuantity(selected, -1)}
-                className="py-3 rounded-2xl border border-white/10 font-semibold hover:bg-white/5"
-              >
-                -1 Quantity
-              </button>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => openEditModal(selected)}
-              className="w-full py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 font-semibold"
-            >
-              Edit Item
-            </button>
-          </div>
+      {(errorMsg || successMsg) && (
+        <div className="mb-6 space-y-3">
+          {errorMsg && <div className="text-rose-400">{errorMsg}</div>}
+          {successMsg && <div className="text-emerald-400">{successMsg}</div>}
         </div>
       )}
 
-      {showModal && (
+      <div className="grid grid-cols-4 gap-6 mb-8">
+        <StatCard title="Items" value={stats.total} icon={<Package size={20} />} />
+        <StatCard title="Low Stock" value={stats.low} icon={<AlertTriangle size={20} />} />
+        <StatCard title="Out" value={stats.out} icon={<AlertTriangle size={20} />} />
+        <StatCard title="Inventory Value" value={money(stats.value)} icon={<DollarSign size={20} />} />
+      </div>
+
+      <div className="relative mb-6 max-w-md">
+        <Search className="absolute left-3 top-3 text-zinc-500" size={16} />
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          className="w-full bg-zinc-900 pl-10 py-3 rounded-xl"
+          placeholder="Search inventory..."
+        />
+      </div>
+
+      <table className="w-full text-left bg-zinc-900 rounded-xl overflow-hidden">
+        <thead className="bg-zinc-800 text-xs uppercase">
+          <tr>
+            <th className="p-4">Name</th>
+            <th className="p-4">SKU</th>
+            <th className="p-4">Qty</th>
+            <th className="p-4">Cost</th>
+            <th className="p-4">Price</th>
+            <th className="p-4"></th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {loading ? (
+            <tr>
+              <td className="p-6" colSpan={6}>
+                Loading...
+              </td>
+            </tr>
+          ) : filtered.length === 0 ? (
+            <tr>
+              <td className="p-6" colSpan={6}>
+                No inventory found.
+              </td>
+            </tr>
+          ) : (
+            filtered.map((item) => (
+              <tr key={item.id} className="border-t border-zinc-800">
+                <td className="p-4 cursor-pointer" onClick={() => selectItem(item)}>{item.name}</td>
+                <td className="p-4 font-mono cursor-pointer" onClick={() => selectItem(item)}>{item.sku}</td>
+                <td className="p-4">
+                  {item.quantity}
+                  <button onClick={() => adjustQuantity(item, 1)} className="ml-3 text-emerald-400">+</button>
+                  <button onClick={() => adjustQuantity(item, -1)} className="ml-2 text-rose-400">-</button>
+                </td>
+                <td className="p-4">{money(item.cost)}</td>
+                <td className="p-4">{money(item.sell_price)}</td>
+                <td className="p-4 flex gap-2">
+                  <button onClick={() => openEditItem(item)}>
+                    <Edit3 size={16} />
+                  </button>
+                  <button onClick={() => removeItem(item.id)}>
+                    <Trash2 size={16} />
+                  </button>
+                </td>
+              </tr>
+            ))
+          )}
+        </tbody>
+      </table>
+
+      {showItemModal && (
         <div className="fixed inset-0 bg-black/85 backdrop-blur-sm z-[100] flex items-center justify-center p-6">
           <form
-            onSubmit={handleSave}
+            onSubmit={saveItem}
             className="w-full max-w-2xl bg-zinc-900 border border-white/10 rounded-3xl p-8"
           >
             <div className="flex items-start justify-between gap-4 mb-6">
@@ -550,28 +565,18 @@ export default function InventoryPage() {
                   {editingId ? "Update the inventory record." : "Create a new inventory record."}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setShowModal(false)}
-                className="p-2 rounded-xl hover:bg-white/5"
-              >
+              <button type="button" onClick={() => setShowItemModal(false)} className="p-2 rounded-xl hover:bg-white/5">
                 <X size={20} />
               </button>
             </div>
-
-            {errorMsg && (
-              <div className="mb-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-rose-300">
-                {errorMsg}
-              </div>
-            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
               <div className="md:col-span-2">
                 <label className="block text-sm mb-2 text-zinc-400">Name</label>
                 <input
                   required
-                  value={form.name}
-                  onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
+                  value={itemForm.name}
+                  onChange={(e) => setItemForm((p) => ({ ...p, name: e.target.value }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
                 />
               </div>
@@ -580,30 +585,27 @@ export default function InventoryPage() {
                 <label className="block text-sm mb-2 text-zinc-400">SKU</label>
                 <input
                   required
-                  value={form.sku}
-                  onChange={(e) => setForm((prev) => ({ ...prev, sku: normalizeSku(e.target.value) }))}
+                  value={itemForm.sku}
+                  onChange={(e) => setItemForm((p) => ({ ...p, sku: normalizeSku(e.target.value) }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500 font-mono"
-                  placeholder="SKU-001"
                 />
               </div>
 
               <div>
                 <label className="block text-sm mb-2 text-zinc-400">Category</label>
                 <input
-                  value={form.category}
-                  onChange={(e) => setForm((prev) => ({ ...prev, category: e.target.value }))}
+                  value={itemForm.category}
+                  onChange={(e) => setItemForm((p) => ({ ...p, category: e.target.value }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
-                  placeholder="Archery"
                 />
               </div>
 
               <div>
                 <label className="block text-sm mb-2 text-zinc-400">Supplier</label>
                 <input
-                  value={form.supplier}
-                  onChange={(e) => setForm((prev) => ({ ...prev, supplier: e.target.value }))}
+                  value={itemForm.supplier}
+                  onChange={(e) => setItemForm((p) => ({ ...p, supplier: e.target.value }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
-                  placeholder="Main supplier"
                 />
               </div>
 
@@ -612,10 +614,8 @@ export default function InventoryPage() {
                 <input
                   type="number"
                   min="0"
-                  value={form.quantity}
-                  onChange={(e) =>
-                    setForm((prev) => ({ ...prev, quantity: Number(e.target.value) }))
-                  }
+                  value={itemForm.quantity}
+                  onChange={(e) => setItemForm((p) => ({ ...p, quantity: Number(e.target.value) }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
                 />
               </div>
@@ -625,10 +625,8 @@ export default function InventoryPage() {
                 <input
                   type="number"
                   min="0"
-                  value={form.reorder_level}
-                  onChange={(e) =>
-                    setForm((prev) => ({ ...prev, reorder_level: Number(e.target.value) }))
-                  }
+                  value={itemForm.reorder_level}
+                  onChange={(e) => setItemForm((p) => ({ ...p, reorder_level: Number(e.target.value) }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
                 />
               </div>
@@ -639,10 +637,8 @@ export default function InventoryPage() {
                   type="number"
                   min="0"
                   step="0.01"
-                  value={form.cost}
-                  onChange={(e) =>
-                    setForm((prev) => ({ ...prev, cost: Number(e.target.value) }))
-                  }
+                  value={itemForm.cost}
+                  onChange={(e) => setItemForm((p) => ({ ...p, cost: Number(e.target.value) }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
                 />
               </div>
@@ -653,10 +649,8 @@ export default function InventoryPage() {
                   type="number"
                   min="0"
                   step="0.01"
-                  value={form.sell_price}
-                  onChange={(e) =>
-                    setForm((prev) => ({ ...prev, sell_price: Number(e.target.value) }))
-                  }
+                  value={itemForm.sell_price}
+                  onChange={(e) => setItemForm((p) => ({ ...p, sell_price: Number(e.target.value) }))}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
                 />
               </div>
@@ -664,11 +658,10 @@ export default function InventoryPage() {
               <div className="md:col-span-2">
                 <label className="block text-sm mb-2 text-zinc-400">Notes</label>
                 <textarea
-                  value={form.notes}
-                  onChange={(e) => setForm((prev) => ({ ...prev, notes: e.target.value }))}
+                  value={itemForm.notes}
+                  onChange={(e) => setItemForm((p) => ({ ...p, notes: e.target.value }))}
                   rows={4}
                   className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500 resize-none"
-                  placeholder="Optional notes"
                 />
               </div>
             </div>
@@ -676,18 +669,308 @@ export default function InventoryPage() {
             <div className="mt-8 flex gap-4">
               <button
                 type="button"
-                onClick={() => setShowModal(false)}
+                onClick={() => setShowItemModal(false)}
                 className="flex-1 py-3 rounded-2xl border border-white/10 hover:bg-white/5"
-                disabled={saving}
               >
-                Cancel\
+                Cancel
               </button>
+              <button type="submit" className="flex-1 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 font-semibold">
+                {editingId ? "Update Item" : "Save Item"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {selected && (
+        <div className="fixed inset-y-0 right-0 w-full max-w-3xl bg-zinc-950 border-l border-white/10 z-50 p-8 overflow-y-auto">
+          <div className="flex items-center justify-between mb-8">
+            <div>
+              <h2 className="text-3xl font-bold">{selected.name}</h2>
+              <div className="text-zinc-400 font-mono mt-1">{selected.sku}</div>
+            </div>
+            <button onClick={() => setSelected(null)} className="p-2 rounded-xl hover:bg-white/5">
+              <X size={22} />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-4 gap-4 mb-8">
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">On Hand</div>
+              <div className="text-2xl font-bold">{selected.quantity}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Unit Cost</div>
+              <div className="text-2xl font-bold">{money(selected.cost)}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Sell Price</div>
+              <div className="text-2xl font-bold">{money(selected.sell_price)}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Supplier</div>
+              <div className="text-lg font-semibold">{selected.supplier || "-"}</div>
+            </div>
+          </div>
+
+          <div className="flex gap-4 mb-8">
+            <button
+              onClick={() => adjustQuantity(selected, 1)}
+              className="px-4 py-3 rounded-2xl bg-white text-black font-semibold"
+            >
+              +1 Quantity
+            </button>
+            <button
+              onClick={() => adjustQuantity(selected, -1)}
+              className="px-4 py-3 rounded-2xl border border-white/10 font-semibold"
+            >
+              -1 Quantity
+            </button>
+            <button
+              onClick={openSaleModal}
+              className="px-4 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 font-semibold"
+            >
+              Record Sale
+            </button>
+            <button
+              onClick={() => openEditItem(selected)}
+              className="px-4 py-3 rounded-2xl border border-white/10 font-semibold"
+            >
+              Edit Item
+            </button>
+          </div>
+
+          <div className="grid grid-cols-5 gap-4 mb-8">
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Gross</div>
+              <div className="text-xl font-bold">{money(selectedSalesSummary.gross)}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Shipping Cost</div>
+              <div className="text-xl font-bold">{money(selectedSalesSummary.shipping)}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Fees</div>
+              <div className="text-xl font-bold">{money(selectedSalesSummary.fees)}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">COGS</div>
+              <div className="text-xl font-bold">{money(selectedSalesSummary.cogs)}</div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl p-4">
+              <div className="text-xs text-zinc-500 uppercase mb-1">Net</div>
+              <div className="text-xl font-bold">{money(selectedSalesSummary.net)}</div>
+            </div>
+          </div>
+
+          <div className="bg-zinc-900 rounded-3xl overflow-hidden">
+            <div className="px-6 py-4 border-b border-white/10 text-lg font-semibold">Sales History</div>
+
+            {salesLoading ? (
+              <div className="p-6 text-zinc-400">Loading sales...</div>
+            ) : sales.length === 0 ? (
+              <div className="p-6 text-zinc-400">No sales recorded for this item yet.</div>
+            ) : (
+              <table className="w-full text-left">
+                <thead className="bg-zinc-800 text-xs uppercase text-zinc-400">
+                  <tr>
+                    <th className="p-4">When</th>
+                    <th className="p-4">Where</th>
+                    <th className="p-4">Qty</th>
+                    <th className="p-4">Sale</th>
+                    <th className="p-4">Shipping</th>
+                    <th className="p-4">Fees</th>
+                    <th className="p-4">Net</th>
+                    <th className="p-4"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sales.map((sale) => {
+                    const gross = Number(sale.sale_price || 0) + Number(sale.shipping_charged || 0);
+                    const fees = Number(sale.platform_fee || 0) + Number(sale.other_fee || 0);
+                    const cogs = Number(selected.cost || 0) * Number(sale.quantity || 0);
+                    const net = gross - Number(sale.shipping_cost || 0) - fees - cogs;
+
+                    return (
+                      <tr key={sale.id} className="border-t border-zinc-800">
+                        <td className="p-4">
+                          {new Date(sale.sold_at).toLocaleString()}
+                          <div className="text-xs text-zinc-500">{sale.order_number || "-"}</div>
+                        </td>
+                        <td className="p-4">
+                          {sale.channel}
+                          <div className="text-xs text-zinc-500">{sale.customer_name || "-"}</div>
+                        </td>
+                        <td className="p-4">{sale.quantity}</td>
+                        <td className="p-4">{money(sale.sale_price)}</td>
+                        <td className="p-4">
+                          charged {money(sale.shipping_charged)}
+                          <div className="text-xs text-zinc-500">cost {money(sale.shipping_cost)}</div>
+                        </td>
+                        <td className="p-4">
+                          {money(Number(sale.platform_fee || 0) + Number(sale.other_fee || 0))}
+                        </td>
+                        <td className="p-4">{money(net)}</td>
+                        <td className="p-4">
+                          <button
+                            onClick={() => removeSale(sale.id)}
+                            className="text-rose-400 hover:text-rose-300"
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showSaleModal && selected && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-sm z-[110] flex items-center justify-center p-6">
+          <form
+            onSubmit={saveSale}
+            className="w-full max-w-3xl bg-zinc-900 border border-white/10 rounded-3xl p-8"
+          >
+            <div className="flex items-start justify-between gap-4 mb-6">
+              <div>
+                <h2 className="text-3xl font-bold">Record Sale</h2>
+                <p className="text-zinc-400 mt-2">{selected.name}</p>
+              </div>
+              <button type="button" onClick={() => setShowSaleModal(false)} className="p-2 rounded-xl hover:bg-white/5">
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Sold At</label>
+                <input
+                  type="datetime-local"
+                  value={saleForm.sold_at}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, sold_at: e.target.value }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Where Sold</label>
+                <input
+                  value={saleForm.channel}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, channel: e.target.value }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                  placeholder="Walmart, eBay, Amazon, Local, Website"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Order Number</label>
+                <input
+                  value={saleForm.order_number}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, order_number: e.target.value }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Customer</label>
+                <input
+                  value={saleForm.customer_name}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, customer_name: e.target.value }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Quantity Sold</label>
+                <input
+                  type="number"
+                  min="1"
+                  value={saleForm.quantity}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, quantity: Number(e.target.value) }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Sale Price</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={saleForm.sale_price}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, sale_price: Number(e.target.value) }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Shipping Charged</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={saleForm.shipping_charged}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, shipping_charged: Number(e.target.value) }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Actual Shipping Cost</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={saleForm.shipping_cost}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, shipping_cost: Number(e.target.value) }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Platform Fee</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={saleForm.platform_fee}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, platform_fee: Number(e.target.value) }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-2 text-zinc-400">Other Fee</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={saleForm.other_fee}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, other_fee: Number(e.target.value) }))}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-sm mb-2 text-zinc-400">Notes</label>
+                <textarea
+                  value={saleForm.notes}
+                  onChange={(e) => setSaleForm((p) => ({ ...p, notes: e.target.value }))}
+                  rows={4}
+                  className="w-full bg-black border border-white/10 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500 resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="mt-8 flex gap-4">
               <button
-                type="submit"
-                className="flex-1 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 font-semibold disabled:opacity-60"
-                disabled={saving}
+                type="button"
+                onClick={() => setShowSaleModal(false)}
+                className="flex-1 py-3 rounded-2xl border border-white/10 hover:bg-white/5"
               >
-                {saving ? "Saving..." : editingId ? "Update Item" : "Save Item"}
+                Cancel
+              </button>
+              <button type="submit" className="flex-1 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 font-semibold">
+                Save Sale
               </button>
             </div>
           </form>
