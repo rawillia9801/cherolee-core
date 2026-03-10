@@ -1,5 +1,18 @@
 // FILE: app/api/ai/chat/route.ts
-// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction + Puppy Availability Tool)
+// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction + Puppy Ops)
+//
+// CHANGELOG
+// - FIX: "Add <puppy>" now performs a REAL DB write via dispatchTool (no more fake success).
+// - FIX: Assistant is forbidden from claiming a puppy was added unless we have a real puppy id.
+// - ADD: Lightweight command router for:
+//   - Add <Name> (creates puppy, defaults status=available)
+//   - Available Puppies / How many puppies are available (reads from DB)
+// - ADD: Meta debug fields saved with assistant messages (tool results + counts)
+//
+// NOTE
+// - No localStorage (server route).
+// - Uses createServiceClient() because your project already uses service role on the server.
+// - If your dispatchTool doesn't have "create_puppy" yet, add it there (next file).
 
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
@@ -127,15 +140,34 @@ function formatMoney(v: any) {
 
 function looksLikePuppyAvailabilityQuestion(text: string) {
   const s = text.trim().toLowerCase();
-  // Covers: "how many puppies are for sale", "available puppies", "list puppies for sale", "names and price"
   return (
-    /\bhow many\b/.test(s) &&
-      (/\bpupp(y|ies)\b/.test(s) || /\bfor sale\b/.test(s) || /\bavailable\b/.test(s)) ||
+    (/\bhow many\b/.test(s) && (/\bpupp(y|ies)\b/.test(s) || /\bfor sale\b/.test(s) || /\bavailable\b/.test(s))) ||
     /\bavailable puppies\b/.test(s) ||
     /\bpuppies for sale\b/.test(s) ||
     (/\blist\b/.test(s) && /\bpupp(y|ies)\b/.test(s)) ||
     (/\bnames?\b/.test(s) && /\bprice\b/.test(s) && /\bpupp(y|ies)\b/.test(s))
   );
+}
+
+/**
+ * Command: Add <Name>
+ * Examples:
+ * - "Add Aurora"
+ * - "add aurora"
+ * - "add puppy Aurora"
+ * - "add puppy: Aurora"
+ */
+function parseAddPuppyCommand(text: string): { name: string } | null {
+  const s = text.trim();
+
+  // add puppy: Aurora
+  let m = s.match(/^\s*add\s+(?:puppy\s*)?:?\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,60})\s*$/i);
+  if (m?.[1]) {
+    const name = m[1].trim();
+    if (name.length >= 1) return { name };
+  }
+
+  return null;
 }
 
 export async function POST(req: Request) {
@@ -186,15 +218,65 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Failed to store message." }, { status: 500 });
   }
 
-  // 3) If this is the "how many puppies are for sale" question, answer from DB immediately
-  //    (This is the missing operational piece.)
+  // 3) HARD command router (REAL operations only)
+  // 3A) Add puppy (REAL tool call + proof of write)
+  const addCmd = parseAddPuppyCommand(message);
+  if (addCmd) {
+    const toolCall: ToolCall = {
+      tool: "create_puppy",
+      args: {
+        org_key: ORG_KEY,
+        owner_id: CORE_OWNER_ID,
+        name: addCmd.name,
+        status: "available",
+      },
+    };
+
+    const toolResult = await dispatchTool(toolCall);
+
+    // PROOF RULE: we only say "added" if ok + id exists.
+    const ok = !!(toolResult as any)?.ok;
+    const puppyId = (toolResult as any)?.data?.id ?? (toolResult as any)?.puppy?.id ?? null;
+
+    let reply = "";
+    if (ok && puppyId) {
+      reply = `Added **${addCmd.name}** to puppy records and marked as **available**. (id: ${puppyId})`;
+    } else {
+      const errMsg =
+        (toolResult as any)?.error ||
+        (toolResult as any)?.message ||
+        "Create puppy failed (no id returned).";
+      reply = `I could not add **${addCmd.name}**. ${errMsg}`;
+    }
+
+    await supabase.from("chat_messages").insert({
+      thread_id,
+      role: "assistant",
+      content: reply,
+      meta: {
+        used_tool: "create_puppy",
+        tool_calls: [toolCall],
+        tool_results: [toolResult],
+        proof: { ok, puppyId },
+      },
+      org_key: ORG_KEY,
+    });
+
+    return NextResponse.json({
+      thread_id,
+      reply,
+      tool_results: [toolResult],
+      fact_apply: null,
+    });
+  }
+
+  // 3B) Availability questions (REAL DB read)
   if (looksLikePuppyAvailabilityQuestion(message)) {
     try {
       const pups = await listAvailablePuppies({ supabase, owner_id: CORE_OWNER_ID, org_key: ORG_KEY });
-
       const count = pups.length;
 
-      const lines =
+      const reply =
         count === 0
           ? "You currently have 0 puppies marked as **available**."
           : [
@@ -209,14 +291,15 @@ export async function POST(req: Request) {
               }),
             ].join("\n");
 
-      const reply = lines;
-
-      // store assistant reply
       await supabase.from("chat_messages").insert({
         thread_id,
         role: "assistant",
         content: reply,
-        meta: { tool_results: [], fact_apply: null, used_tool: "listAvailablePuppies" },
+        meta: {
+          used_tool: "listAvailablePuppies",
+          counts: { available: count },
+          sample_ids: pups.slice(0, 10).map((p: any) => p?.id).filter(Boolean),
+        },
         org_key: ORG_KEY,
       });
 
@@ -228,13 +311,13 @@ export async function POST(req: Request) {
       });
     } catch (e: any) {
       console.error("Puppy availability query failed:", e);
-      const reply = "I couldn’t pull the puppy list right now. If you want, I can still answer if you paste the names and prices.";
+      const reply = "I couldn’t pull the puppy list right now. Try again in a moment.";
 
       await supabase.from("chat_messages").insert({
         thread_id,
         role: "assistant",
         content: reply,
-        meta: { error: e?.message ?? String(e) },
+        meta: { error: e?.message ?? String(e), used_tool: "listAvailablePuppies" },
         org_key: ORG_KEY,
       });
 
@@ -254,7 +337,7 @@ export async function POST(req: Request) {
 
   const anthropicMessages = toAnthropicMessages((recentMsgs ?? []) as DbMsg[]);
 
-  // 5) (Optional) rule-based tool calls still supported
+  // 5) Optional rule-based tool calls (kept)
   const toolCalls: ToolCall[] = [];
   if (message.toLowerCase().startsWith("test litter")) {
     toolCalls.push({
@@ -322,6 +405,7 @@ Voice:
 Rules:
 - Use the conversation history.
 - Do NOT invent weights, dates, prices, buyer names, or payment statuses.
+- CRITICAL: Do NOT claim you created/updated a record unless a tool result proves it.
 
 If you successfully recorded a fact, confirm it plainly.
 If the user asked a question, answer it.
@@ -356,7 +440,7 @@ Keep it tight and useful.
     reply = "I hit a temporary issue generating a response. Please try again.";
   }
 
-  // 8) Insert assistant reply with meta (tool + fact results)
+  // 8) Insert assistant reply with meta
   const { error: insertAsstErr } = await supabase.from("chat_messages").insert({
     thread_id,
     role: "assistant",

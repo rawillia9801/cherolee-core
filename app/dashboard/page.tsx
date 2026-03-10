@@ -1,32 +1,31 @@
 // FILE: app/dashboard/page.tsx
-// CHEROLEE — Dashboard Home (Cards + KPIs + Persistent “Chat with Core”)
-// ✅ This is the DASHBOARD LANDING PAGE (NOT the full Core console)
-// ✅ All cards share the same component (no odd-balls)
-// ✅ Inventory card INCLUDED
-// ✅ Chat with Core widget INCLUDED on the dashboard (persistent, docked)
-// ✅ No localStorage; chat thread persists via URL (?core_thread=...)
+// CHEROLEE — Dashboard Home
 //
-// CHANGELOG
-// - RESTORE: /dashboard is now the card-based dashboard home (not the Core console)
-// - ADD: KPI cards row (Total Profit, Pending Shipments, Active Inventory, YTD Fees)
-// - ADD: Uniform DashboardCards grid (same layout + styling for every card)
-// - ADD: Inventory card (links to /dashboard/inventory)
-// - ADD: SWVA Chihuahua hub card (links to /dashboard/swva)
-// - ADD: Persistent “Chat with Core” docked widget (uses /api/ai/chat, no localStorage)
-// - KEEP: Dark, modern, organized UI with consistent spacing and hierarchy
+// PURPOSE
+// - Fix Next.js build error caused by useSearchParams() on /dashboard
+// - Use a lighter, more visually appealing UI
+// - Keep /dashboard as the dashboard landing page
+// - Keep the persistent "Chat with Core" widget docked on the dashboard
+// - Keep thread state in the URL (?core_thread=...)
+// - No localStorage
 //
-// ANCHOR:ROUTES
+// ROUTES
 // - Full Core console: /dashboard/core
 // - Inventory:         /dashboard/inventory
-// - Chat API:          /api/ai/chat  (POST)
+// - Transactions:      /dashboard/transactions
+// - Reports:           /dashboard/reports
+// - SWVA Hub:          /dashboard/swva
+// - Chat API:          /api/ai/chat
 //
-// ANCHOR:URLSTATE
-// - Chat thread stored in URL: ?core_thread=<thread_id>
+// NOTES
+// - This file is a COMPLETE replacement for app/dashboard/page.tsx
+// - It moves useSearchParams() into an inner component wrapped with <Suspense>
+//   so Vercel / Next.js can build /dashboard correctly.
 
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 function cx(...parts: Array<string | false | null | undefined>) {
@@ -43,9 +42,6 @@ async function safeJson(res: Response) {
   }
 }
 
-/* ──────────────────────────────────────────────────────────────
-   TYPES (UI-level only; no schema guessing)
-────────────────────────────────────────────────────────────── */
 type ChatMsg = {
   id: string;
   role: "user" | "assistant" | "tool" | "system";
@@ -59,12 +55,10 @@ type Card = {
   href: string;
   badge?: string;
   tag?: string;
+  tone?: "primary" | "normal" | "muted";
   icon: React.ReactNode;
 };
 
-/* ──────────────────────────────────────────────────────────────
-   ICONS (inline so you don’t need extra deps)
-────────────────────────────────────────────────────────────── */
 function IconGrid() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-90">
@@ -75,6 +69,7 @@ function IconGrid() {
     </svg>
   );
 }
+
 function IconBox() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-90">
@@ -85,6 +80,7 @@ function IconBox() {
     </svg>
   );
 }
+
 function IconChat() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-90">
@@ -95,6 +91,7 @@ function IconChat() {
     </svg>
   );
 }
+
 function IconChart() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-90">
@@ -102,6 +99,7 @@ function IconChart() {
     </svg>
   );
 }
+
 function IconPaw() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-90">
@@ -113,78 +111,217 @@ function IconPaw() {
   );
 }
 
-export default function DashboardHome() {
+function IconShield() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-90">
+      <path
+        fill="currentColor"
+        d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3Zm0 17.9c-3.4-1.2-6-5.3-6-8.9V6.4l6-2.3 6 2.3V11c0 3.6-2.6 7.7-6 8.9Z"
+      />
+    </svg>
+  );
+}
+
+function DashboardFallback() {
+  return (
+    <main className="min-h-screen bg-gradient-to-b from-zinc-50 to-white text-zinc-900">
+      <div className="mx-auto max-w-7xl px-6 py-10">
+        <div className="rounded-3xl border border-zinc-200 bg-white p-6 shadow-sm">
+          <div className="text-sm text-zinc-600">Loading dashboard…</div>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function KpiCard({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string;
+  hint: string;
+}) {
+  return (
+    <div className="rounded-3xl border border-zinc-200 bg-white p-4 shadow-sm">
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+        {label}
+      </div>
+      <div className="mt-2 text-2xl font-semibold tracking-tight text-zinc-900">
+        {value}
+      </div>
+      <div className="mt-1 text-xs text-zinc-500">{hint}</div>
+    </div>
+  );
+}
+
+function WorkCard({ card }: { card: Card }) {
+  const toneClasses =
+    card.tone === "primary"
+      ? "border-indigo-200 bg-gradient-to-br from-indigo-50 via-white to-white"
+      : card.tone === "muted"
+      ? "border-zinc-200 bg-zinc-50"
+      : "border-zinc-200 bg-white";
+
+  return (
+    <Link
+      href={card.href}
+      className={cx(
+        "group block rounded-3xl border p-5 shadow-sm transition",
+        "hover:-translate-y-[1px] hover:shadow-md",
+        "focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2",
+        toneClasses
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-zinc-200 bg-white text-zinc-800">
+            {card.icon}
+          </div>
+
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="truncate text-base font-semibold text-zinc-900">
+                {card.title}
+              </h3>
+
+              {card.badge ? (
+                <span className="inline-flex items-center rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-700">
+                  {card.badge}
+                </span>
+              ) : null}
+
+              {card.tag ? (
+                <span className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                  {card.tag}
+                </span>
+              ) : null}
+            </div>
+
+            <p className="mt-1 text-sm text-zinc-600">{card.subtitle}</p>
+          </div>
+        </div>
+
+        <div className="shrink-0 rounded-xl border border-zinc-200 bg-white px-2.5 py-1 text-xs font-semibold text-indigo-700 transition group-hover:bg-indigo-50">
+          Open →
+        </div>
+      </div>
+
+      <div className="mt-4 flex items-center justify-between border-t border-zinc-200 pt-3 text-xs text-zinc-500">
+        <span className="truncate">{card.href}</span>
+        <span>Module is live</span>
+      </div>
+    </Link>
+  );
+}
+
+function Section({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="mt-10">
+      <div className="mb-4">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-800">
+          {title}
+        </h2>
+        {subtitle ? <p className="mt-1 text-sm text-zinc-600">{subtitle}</p> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function DashboardHomeInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  // ANCHOR:ORG
   const ORG_KEY = "swva";
 
-  /* ──────────────────────────────────────────────────────────────
-     KPI placeholders (wired later — no schema guessing here)
-────────────────────────────────────────────────────────────── */
   const kpis = useMemo(
     () => [
-      { label: "Total Profit", value: "—", hint: "This month" },
-      { label: "Pending Shipments", value: "—", hint: "Open orders" },
-      { label: "Active Inventory", value: "—", hint: "Items tracked" },
-      { label: "YTD Fees", value: "—", hint: "Platform + processing" },
+      { label: "Phase", value: "1", hint: "Memory • Safe Mutation • Audit" },
+      { label: "Backend", value: "Supabase", hint: "Core tables wired" },
+      { label: "Safety", value: "No-Guess", hint: "Confidence + idempotent updates" },
+      { label: "Audit", value: "Always On", hint: "Tool dispatch logged" },
     ],
     []
   );
 
-  /* ──────────────────────────────────────────────────────────────
-     Dashboard cards (UNIFORM component)
-────────────────────────────────────────────────────────────── */
-  const cards: Card[] = useMemo(
+  const authority: Card[] = useMemo(
     () => [
       {
         title: "Core Console",
-        subtitle: "Full sessions view, threads, message history, tools.",
+        subtitle:
+          "Threaded Core Chat, tool dispatch, memory, and controlled execution.",
         href: "/dashboard/core",
-        badge: "live",
+        badge: "Authority",
         tag: "chat",
-        icon: <IconChat />,
+        tone: "primary",
+        icon: <IconShield />,
+      },
+    ],
+    []
+  );
+
+  const operations: Card[] = useMemo(
+    () => [
+      {
+        title: "SWVA Chihuahua Hub",
+        subtitle:
+          "Breeding operations surface for puppies, litters, buyers, and branch activity.",
+        href: "/dashboard/swva",
+        badge: "Ops",
+        tag: "swva",
+        tone: "normal",
+        icon: <IconPaw />,
       },
       {
         title: "Inventory",
-        subtitle: "Stock levels, low-stock alerts, Core-driven adjustments.",
+        subtitle:
+          "Track stock levels, cost, quantities, and Core-driven inventory adjustments.",
         href: "/dashboard/inventory",
-        badge: "live",
-        tag: "ops",
+        badge: "Ops",
+        tag: "inventory",
+        tone: "normal",
         icon: <IconBox />,
       },
       {
         title: "Transactions",
-        subtitle: "Sales, fees, shipping, COGS, refunds — clean ledger view.",
+        subtitle:
+          "Sales, fees, shipping, COGS, refunds, and clean ledger reconciliation.",
         href: "/dashboard/transactions",
+        badge: "Ops",
         tag: "finance",
+        tone: "normal",
         icon: <IconChart />,
-      },
-      {
-        title: "Reports",
-        subtitle: "Export CSV/Excel for taxes, filters by platform and dates.",
-        href: "/dashboard/reports",
-        tag: "export",
-        icon: <IconGrid />,
-      },
-      {
-        title: "SWVA Chihuahua Hub",
-        subtitle: "Branch health: puppies, supplies, margins, buyer activity.",
-        href: "/dashboard/swva",
-        badge: "priority",
-        tag: "swva",
-        icon: <IconPaw />,
       },
     ],
     []
   );
 
-  /* ──────────────────────────────────────────────────────────────
-     PERSISTENT “CHAT WITH CORE” WIDGET (no localStorage)
-     - Stores thread in URL: ?core_thread=<id>
-     - Uses /api/ai/chat (your existing Claude/Core endpoint)
-────────────────────────────────────────────────────────────── */
+  const oversight: Card[] = useMemo(
+    () => [
+      {
+        title: "Reports",
+        subtitle:
+          "Read-only summaries, exports, performance snapshots, and operational verification.",
+        href: "/dashboard/reports",
+        badge: "Oversight",
+        tag: "export",
+        tone: "muted",
+        icon: <IconGrid />,
+      },
+    ],
+    []
+  );
+
   const urlThread = (searchParams.get("core_thread") ?? "").trim();
   const [threadId, setThreadId] = useState<string>(urlThread);
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
@@ -194,6 +331,7 @@ export default function DashboardHome() {
   const [chatErr, setChatErr] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
   function scrollToBottom() {
     setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
   }
@@ -202,14 +340,15 @@ export default function DashboardHome() {
     const params = new URLSearchParams(searchParams.toString());
     if (id) params.set("core_thread", id);
     else params.delete("core_thread");
-    router.replace(`?${params.toString()}`);
+    const q = params.toString();
+    router.replace(q ? `?${q}` : "/dashboard");
   }
 
-  // Sync state <- URL
   useEffect(() => {
-    if (urlThread && urlThread !== threadId) setThreadId(urlThread);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [urlThread]);
+    if (urlThread && urlThread !== threadId) {
+      setThreadId(urlThread);
+    }
+  }, [urlThread, threadId]);
 
   async function sendChat() {
     const text = input.trim();
@@ -259,36 +398,22 @@ export default function DashboardHome() {
         setThreadInUrl(newThreadId);
       }
 
-      // Prefer explicit assistant content if returned
       const assistantText =
         (data?.reply ?? data?.message ?? data?.content ?? data?.assistant ?? "") as string;
 
-      if (assistantText && assistantText.trim()) {
-        setMsgs((prev) => [
-          ...prev,
-          {
-            id: `assistant-${Date.now()}`,
-            role: "assistant",
-            content: assistantText,
-            created_at: new Date().toISOString(),
-          },
-        ]);
-        scrollToBottom();
-      } else {
-        // If your API doesn’t return a reply body (only writes to DB),
-        // we still keep the widget functional without crashing.
-        setMsgs((prev) => [
-          ...prev,
-          {
-            id: `assistant-${Date.now()}`,
-            role: "assistant",
-            content:
-              "Recorded. If you want to see the full thread history, open Core Console.",
-            created_at: new Date().toISOString(),
-          },
-        ]);
-        scrollToBottom();
-      }
+      setMsgs((prev) => [
+        ...prev,
+        {
+          id: `assistant-${Date.now()}`,
+          role: "assistant",
+          content:
+            assistantText && assistantText.trim()
+              ? assistantText
+              : "Recorded. If you want to see the full thread history, open Core Console.",
+          created_at: new Date().toISOString(),
+        },
+      ]);
+      scrollToBottom();
     } catch (e: any) {
       setChatErr(e?.message ?? "Chat failed");
     } finally {
@@ -304,143 +429,98 @@ export default function DashboardHome() {
     setInput("");
   }
 
-  /* ──────────────────────────────────────────────────────────────
-     UI
-────────────────────────────────────────────────────────────── */
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-50">
-      {/* Ambient background */}
-      <div className="pointer-events-none fixed inset-0 opacity-[0.55]">
-        <div className="absolute -top-24 left-1/3 h-80 w-80 rounded-full bg-cyan-500/10 blur-3xl" />
-        <div className="absolute top-1/3 -left-24 h-80 w-80 rounded-full bg-fuchsia-500/10 blur-3xl" />
-        <div className="absolute -bottom-24 right-1/4 h-96 w-96 rounded-full bg-amber-500/10 blur-3xl" />
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_1px_1px,rgba(255,255,255,0.06)_1px,transparent_0)] [background-size:22px_22px]" />
-        <div className="absolute inset-0 bg-gradient-to-b from-zinc-950/40 via-zinc-950 to-zinc-950" />
+    <main className="min-h-screen bg-gradient-to-b from-zinc-50 to-white text-zinc-900">
+      <div className="pointer-events-none fixed inset-0">
+        <div className="absolute -top-24 left-1/3 h-80 w-80 rounded-full bg-indigo-200/30 blur-3xl" />
+        <div className="absolute top-1/4 -left-20 h-72 w-72 rounded-full bg-cyan-200/30 blur-3xl" />
+        <div className="absolute -bottom-24 right-1/4 h-96 w-96 rounded-full bg-amber-200/25 blur-3xl" />
       </div>
 
-      <div className="relative mx-auto max-w-[1400px] px-4 py-8 pb-28">
-        {/* Header */}
-        <header className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-          <div className="min-w-0">
-            <div className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-3 py-2">
-              <span className="text-[11px] text-zinc-400">Org</span>
-              <span className="text-xs font-semibold text-zinc-100">{ORG_KEY}</span>
+      <header className="relative border-b border-zinc-200 bg-white/80 backdrop-blur">
+        <div className="mx-auto max-w-7xl px-6 py-10">
+          <div className="flex flex-col gap-5 md:flex-row md:items-end md:justify-between">
+            <div className="min-w-0">
+              <div className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-700">
+                Cherolee Core • SWVA Chihuahua • {ORG_KEY}
+              </div>
+
+              <h1 className="mt-3 text-3xl font-semibold tracking-tight text-zinc-900 md:text-4xl">
+                Command Center
+              </h1>
+
+              <p className="mt-2 max-w-3xl text-sm text-zinc-600">
+                Authority-aware dashboard home. Operations stay organized, oversight stays clean,
+                and Core remains available while you work.
+              </p>
             </div>
 
-            <h1 className="mt-3 text-2xl md:text-3xl font-semibold tracking-tight">
-              Cherolee Dashboard
-            </h1>
-            <p className="mt-1 text-sm text-zinc-300">
-              One home screen. Cards open into their own dashboards. Core stays available while you work.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <Link
-              href="/dashboard/core"
-              className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-zinc-100 hover:bg-white/10"
-              title="Open full Core console"
-            >
-              Open Core Console
-            </Link>
-
-            <button
-              onClick={() => setChatOpen((v) => !v)}
-              className="rounded-2xl border border-white/10 bg-black/30 px-4 py-2 text-sm font-semibold text-zinc-100 hover:bg-black/40"
-              title="Toggle the chat dock"
-            >
-              {chatOpen ? "Hide Chat" : "Show Chat"}
-            </button>
-          </div>
-        </header>
-
-        {/* KPI row */}
-        <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {kpis.map((k) => (
-            <div
-              key={k.label}
-              className="rounded-2xl border border-white/10 bg-white/[0.06] backdrop-blur-xl p-4"
-            >
-              <div className="text-[11px] text-zinc-400">{k.label}</div>
-              <div className="mt-1 text-2xl font-semibold text-zinc-100">{k.value}</div>
-              <div className="mt-1 text-xs text-zinc-500">{k.hint}</div>
-            </div>
-          ))}
-        </section>
-
-        {/* Cards grid */}
-        <section className="mt-6">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-zinc-100">Work Areas</h2>
-            <div className="text-xs text-zinc-500">Each card opens its own page — no run-on single file.</div>
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {cards.map((c) => (
+            <div className="flex flex-wrap items-center gap-2">
               <Link
-                key={c.title}
-                href={c.href}
-                className={cx(
-                  "group rounded-3xl border border-white/10 bg-white/[0.05] backdrop-blur-xl p-5 transition",
-                  "hover:bg-white/[0.08] hover:border-white/15"
-                )}
+                href="/dashboard/core"
+                className="inline-flex items-center justify-center rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-start gap-3 min-w-0">
-                    <div className="h-10 w-10 rounded-2xl border border-white/10 bg-black/35 flex items-center justify-center text-zinc-100">
-                      {c.icon}
-                    </div>
-
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <div className="truncate text-base font-semibold text-zinc-100">
-                          {c.title}
-                        </div>
-
-                        {c.badge ? (
-                          <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-300">
-                            {c.badge}
-                          </span>
-                        ) : null}
-
-                        {c.tag ? (
-                          <span className="rounded-full border border-white/10 bg-black/25 px-2 py-0.5 text-[10px] text-zinc-400">
-                            {c.tag}
-                          </span>
-                        ) : null}
-                      </div>
-
-                      <div className="mt-1 text-sm text-zinc-300">
-                        {c.subtitle}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="shrink-0 text-zinc-400 group-hover:text-zinc-200 transition mt-1">
-                    →
-                  </div>
-                </div>
-
-                <div className="mt-4 h-px bg-white/10" />
-                <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
-                  <span className="truncate">{c.href}</span>
-                  <span className="text-zinc-400 group-hover:text-zinc-200 transition">
-                    Open
-                  </span>
-                </div>
+                Open Core Console
               </Link>
+
+              <button
+                onClick={() => setChatOpen((v) => !v)}
+                className="inline-flex items-center justify-center rounded-2xl border border-zinc-200 bg-white px-4 py-2 text-sm font-semibold text-zinc-900 shadow-sm transition hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+              >
+                {chatOpen ? "Hide Chat" : "Show Chat"}
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-7 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {kpis.map((k) => (
+              <KpiCard key={k.label} label={k.label} value={k.value} hint={k.hint} />
             ))}
           </div>
-        </section>
+        </div>
+      </header>
+
+      <div className="relative mx-auto max-w-7xl px-6 py-10 pb-32">
+        <Section
+          title="Authority"
+          subtitle="Where actions are initiated and system truth is allowed to change."
+        >
+          <div className="grid gap-4 md:grid-cols-2">
+            {authority.map((c) => (
+              <WorkCard key={c.title} card={c} />
+            ))}
+          </div>
+        </Section>
+
+        <Section
+          title="Operations"
+          subtitle="Operational modules that feed and consume controlled execution."
+        >
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {operations.map((c) => (
+              <WorkCard key={c.title} card={c} />
+            ))}
+          </div>
+        </Section>
+
+        <Section
+          title="Oversight"
+          subtitle="Read-only verification layers for visibility, exports, and review."
+        >
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {oversight.map((c) => (
+              <WorkCard key={c.title} card={c} />
+            ))}
+          </div>
+        </Section>
       </div>
 
-      {/* Persistent “Chat with Core” Dock */}
       <div className={cx("fixed bottom-4 right-4 z-50", chatOpen ? "" : "hidden")}>
-        <div className="w-[360px] max-w-[92vw] overflow-hidden rounded-3xl border border-white/10 bg-zinc-950/80 backdrop-blur-xl shadow-2xl">
-          <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+        <div className="w-[380px] max-w-[94vw] overflow-hidden rounded-3xl border border-zinc-200 bg-white shadow-2xl">
+          <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
             <div className="min-w-0">
-              <div className="text-sm font-semibold text-zinc-100">Chat with Core</div>
-              <div className="mt-0.5 text-[11px] text-zinc-400 break-all">
+              <div className="text-sm font-semibold text-zinc-900">Chat with Core</div>
+              <div className="mt-0.5 break-all text-[11px] text-zinc-500">
                 {threadId ? `thread: ${threadId}` : "new thread (not yet saved)"}
               </div>
             </div>
@@ -448,24 +528,25 @@ export default function DashboardHome() {
             <div className="flex items-center gap-2">
               <button
                 onClick={newChatThread}
-                className="rounded-2xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-white/10"
-                title="Start a new Core thread"
+                className="rounded-2xl border border-zinc-200 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-900 hover:bg-zinc-50"
               >
                 New
               </button>
 
               <Link
-                href={threadId ? `/dashboard/core?thread=${encodeURIComponent(threadId)}` : "/dashboard/core"}
-                className="rounded-2xl border border-white/10 bg-black/30 px-3 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-black/40"
-                title="Open full console"
+                href={
+                  threadId
+                    ? `/dashboard/core?thread=${encodeURIComponent(threadId)}`
+                    : "/dashboard/core"
+                }
+                className="rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs font-semibold text-zinc-900 hover:bg-zinc-100"
               >
                 Console
               </Link>
 
               <button
                 onClick={() => setChatOpen(false)}
-                className="rounded-2xl border border-white/10 bg-black/30 px-3 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-black/40"
-                title="Hide chat"
+                className="rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs font-semibold text-zinc-900 hover:bg-zinc-100"
               >
                 ✕
               </button>
@@ -473,16 +554,16 @@ export default function DashboardHome() {
           </div>
 
           {chatErr ? (
-            <div className="mx-4 mt-3 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+            <div className="mx-4 mt-3 rounded-2xl border border-rose-300 bg-rose-50 px-3 py-2 text-xs text-rose-700">
               {chatErr}
             </div>
           ) : null}
 
-          <div className="max-h-[320px] overflow-auto px-4 py-3 space-y-2">
+          <div className="max-h-[320px] overflow-auto px-4 py-3 space-y-2 bg-gradient-to-b from-zinc-50 to-white">
             {msgs.length === 0 ? (
-              <div className="rounded-2xl border border-white/10 bg-black/25 p-3 text-xs text-zinc-300">
-                <div className="text-zinc-100 font-semibold">Quick examples:</div>
-                <ul className="mt-2 list-disc pl-4 space-y-1 text-zinc-300">
+              <div className="rounded-2xl border border-zinc-200 bg-white p-3 text-xs text-zinc-600">
+                <div className="font-semibold text-zinc-900">Quick examples:</div>
+                <ul className="mt-2 list-disc space-y-1 pl-4">
                   <li>“Core, add 100 bubble mailers cost 0.18 each.”</li>
                   <li>“Core, I sold a puppy for $1500, shipping $150, fee $50, COGS $200.”</li>
                   <li>“Core, adjust inventory ‘Puppy Pads’ -2 damaged.”</li>
@@ -495,14 +576,14 @@ export default function DashboardHome() {
                   <div key={m.id} className={cx("flex", isUser ? "justify-end" : "justify-start")}>
                     <div
                       className={cx(
-                        "max-w-[92%] rounded-2xl px-3 py-2 text-xs leading-relaxed border",
+                        "max-w-[92%] rounded-2xl border px-3 py-2 text-xs leading-relaxed shadow-sm",
                         isUser
-                          ? "bg-white text-zinc-950 border-white/10"
-                          : "bg-black/30 text-zinc-100 border-white/10"
+                          ? "border-indigo-200 bg-indigo-50 text-zinc-900"
+                          : "border-zinc-200 bg-white text-zinc-900"
                       )}
                     >
                       <div className="whitespace-pre-wrap">{m.content}</div>
-                      <div className={cx("mt-1 text-[10px] opacity-70", isUser ? "text-zinc-700" : "text-zinc-400")}>
+                      <div className="mt-1 text-[10px] text-zinc-500">
                         {new Date(m.created_at).toLocaleTimeString()}
                       </div>
                     </div>
@@ -513,7 +594,7 @@ export default function DashboardHome() {
             <div ref={bottomRef} />
           </div>
 
-          <div className="border-t border-white/10 p-3">
+          <div className="border-t border-zinc-200 bg-white p-3">
             <div className="flex items-end gap-2">
               <textarea
                 value={input}
@@ -527,20 +608,18 @@ export default function DashboardHome() {
                 rows={2}
                 placeholder="Type to Core…"
                 className={cx(
-                  "flex-1 resize-none rounded-2xl border border-white/10 bg-black/40 px-3 py-2 text-xs outline-none",
-                  "focus:border-white/20 focus:bg-black/45",
-                  "min-h-[44px] max-h-[120px]"
+                  "min-h-[44px] max-h-[120px] flex-1 resize-none rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-900 outline-none",
+                  "focus:border-indigo-300 focus:ring-2 focus:ring-indigo-200"
                 )}
               />
               <button
                 onClick={sendChat}
                 disabled={sending}
                 className={cx(
-                  "rounded-2xl px-4 py-2 text-xs font-semibold transition shrink-0",
-                  "bg-white text-zinc-950 hover:bg-zinc-100",
-                  "disabled:opacity-60 disabled:hover:bg-white"
+                  "shrink-0 rounded-2xl px-4 py-2 text-xs font-semibold transition",
+                  "bg-indigo-600 text-white hover:bg-indigo-700",
+                  "disabled:opacity-60 disabled:hover:bg-indigo-600"
                 )}
-                title="Send (Enter)"
               >
                 {sending ? "…" : "Send"}
               </button>
@@ -550,7 +629,7 @@ export default function DashboardHome() {
               <div>Enter to send · Shift+Enter for new line</div>
               <button
                 onClick={scrollToBottom}
-                className="rounded-xl border border-white/10 bg-white/5 px-2 py-1 hover:bg-white/10"
+                className="rounded-xl border border-zinc-200 bg-zinc-50 px-2 py-1 hover:bg-zinc-100"
               >
                 Bottom ↓
               </button>
@@ -559,5 +638,13 @@ export default function DashboardHome() {
         </div>
       </div>
     </main>
+  );
+}
+
+export default function DashboardPage() {
+  return (
+    <Suspense fallback={<DashboardFallback />}>
+      <DashboardHomeInner />
+    </Suspense>
   );
 }
