@@ -1,13 +1,14 @@
 // FILE: app/api/ai/chat/route.ts
-// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction + Puppy Ops)
+// CHEROLEE CORE — Phase B (Anthropic Intelligence + Memory + Fact Extraction + Puppy Ops + Inventory)
 //
 // CHANGELOG
-// - FIX: create thread now validates CORE_OWNER_ID
-// - FIX: thread creation returns the REAL DB error instead of generic "Thread creation failed."
-// - FIX: thread creation tries multiple payload shapes to tolerate schema drift
-// - KEEP: Add <puppy> performs a REAL DB write via dispatchTool
-// - KEEP: Assistant is forbidden from claiming a puppy was added unless we have a real puppy id
-// - KEEP: Lightweight command router for Add <Name> and available puppy queries
+// - KEEP: thread creation validation + useful error reporting
+// - KEEP: add puppy + available puppies
+// - ADD: add inventory command router
+// - ADD: list inventory / what inventory do I have
+// - ADD: adjust inventory command router
+// - FIX: assistant prompt blocks fake function/tool markup
+// - FIX: if an operational action is not wired, assistant should say so plainly
 
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
@@ -15,6 +16,7 @@ import type { ToolCall } from "@/lib/core/types";
 import { dispatchTool } from "@/lib/core/dispatchTool";
 import { applyFactsSafely, type FactExtractResult } from "@/lib/core/facts";
 import { listAvailablePuppies } from "@/lib/core/puppies";
+import { listInventory } from "@/lib/core/inventory";
 
 const ORG_KEY = "swva";
 
@@ -74,6 +76,7 @@ async function callAnthropicText(opts: {
   });
 
   const data = await res.json();
+
   if (!res.ok) {
     console.error("Anthropic error:", data);
     throw new Error(data?.error?.message ?? "Anthropic request failed");
@@ -113,6 +116,7 @@ async function callAnthropicJson(opts: {
   });
 
   const data = await res.json();
+
   if (!res.ok) {
     console.error("Anthropic error:", data);
     throw new Error(data?.error?.message ?? "Anthropic request failed");
@@ -152,14 +156,17 @@ function looksLikePuppyAvailabilityQuestion(text: string) {
   );
 }
 
-/**
- * Command: Add <Name>
- * Examples:
- * - "Add Aurora"
- * - "add aurora"
- * - "add puppy Aurora"
- * - "add puppy: Aurora"
- */
+function looksLikeInventoryListQuestion(text: string) {
+  const s = text.trim().toLowerCase();
+  return (
+    /\bwhat inventory do i have\b/.test(s) ||
+    /\blist inventory\b/.test(s) ||
+    /\bshow inventory\b/.test(s) ||
+    /\bwhat do i have in inventory\b/.test(s) ||
+    (/\bhow many\b/.test(s) && /\binventory\b/.test(s))
+  );
+}
+
 function parseAddPuppyCommand(text: string): { name: string } | null {
   const s = text.trim();
   const m = s.match(/^\s*add\s+(?:puppy\s*)?:?\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,60})\s*$/i);
@@ -168,6 +175,68 @@ function parseAddPuppyCommand(text: string): { name: string } | null {
     if (name.length >= 1) return { name };
   }
   return null;
+}
+
+function parseAddInventoryCommand(text: string): {
+  name: string;
+  quantity: number | null;
+  cost: number | null;
+} | null {
+  const s = text.trim();
+
+  // "add 100 bubble mailers cost 0.18 each"
+  let m = s.match(
+    /^\s*add\s+(\d+)\s+(.+?)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:each)?\s*$/i
+  );
+  if (m) {
+    return {
+      quantity: Number(m[1]),
+      name: m[2].trim(),
+      cost: Number(m[3]),
+    };
+  }
+
+  // "add inventory puppy pads quantity 24 cost 8.99"
+  m = s.match(
+    /^\s*add\s+inventory\s+(.+?)\s+quantity\s+(\d+)\s+cost\s+\$?(\d+(?:\.\d{1,2})?)\s*$/i
+  );
+  if (m) {
+    return {
+      name: m[1].trim(),
+      quantity: Number(m[2]),
+      cost: Number(m[3]),
+    };
+  }
+
+  // "add inventory puppy pads"
+  m = s.match(/^\s*add\s+inventory\s+(.+?)\s*$/i);
+  if (m) {
+    return {
+      name: m[1].trim(),
+      quantity: 0,
+      cost: 0,
+    };
+  }
+
+  return null;
+}
+
+function parseAdjustInventoryCommand(text: string): {
+  name: string;
+  delta: number;
+  notes?: string;
+} | null {
+  const s = text.trim();
+
+  // "adjust inventory puppy pads -2 damaged"
+  const m = s.match(/^\s*adjust\s+inventory\s+(.+?)\s+([+-]?\d+)\s*(.*)$/i);
+  if (!m) return null;
+
+  return {
+    name: m[1].trim(),
+    delta: Number(m[2]),
+    notes: m[3]?.trim() || undefined,
+  };
 }
 
 async function createThreadWithFallbacks(opts: {
@@ -219,10 +288,7 @@ async function createThreadWithFallbacks(opts: {
     }
 
     lastError = error;
-    console.error("chat_threads insert attempt failed:", {
-      payload,
-      error,
-    });
+    console.error("chat_threads insert attempt failed:", { payload, error });
   }
 
   const msg =
@@ -290,7 +356,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3A) Add puppy (REAL tool call + proof of write)
+    // 3A) Add puppy
     const addCmd = parseAddPuppyCommand(message);
     if (addCmd) {
       const toolCall: ToolCall = {
@@ -340,7 +406,103 @@ export async function POST(req: Request) {
       });
     }
 
-    // 3B) Availability questions (REAL DB read)
+    // 3B) Add inventory
+    const addInventoryCmd = parseAddInventoryCommand(message);
+    if (addInventoryCmd) {
+      const toolCall: ToolCall = {
+        tool: "add_inventory",
+        args: {
+          owner_id: CORE_OWNER_ID,
+          name: addInventoryCmd.name,
+          quantity: addInventoryCmd.quantity,
+          cost: addInventoryCmd.cost,
+        },
+      };
+
+      const toolResult = await dispatchTool(toolCall);
+      const ok = !!(toolResult as any)?.ok;
+      const inventoryId = (toolResult as any)?.data?.id ?? null;
+
+      let reply = "";
+      if (ok && inventoryId) {
+        reply = `Added **${addInventoryCmd.name}** to inventory with quantity **${addInventoryCmd.quantity ?? 0}** at **${formatMoney(addInventoryCmd.cost ?? 0)}** each.`;
+      } else {
+        const errMsg =
+          (toolResult as any)?.error ||
+          (toolResult as any)?.message ||
+          "Add inventory failed.";
+        reply = `I could not add **${addInventoryCmd.name}** to inventory. ${errMsg}`;
+      }
+
+      await supabase.from("chat_messages").insert({
+        thread_id,
+        role: "assistant",
+        content: reply,
+        meta: {
+          used_tool: "add_inventory",
+          tool_calls: [toolCall],
+          tool_results: [toolResult],
+        },
+        org_key: ORG_KEY,
+      });
+
+      return NextResponse.json({
+        thread_id,
+        reply,
+        tool_results: [toolResult],
+        fact_apply: null,
+      });
+    }
+
+    // 3C) Adjust inventory
+    const adjustInventoryCmd = parseAdjustInventoryCommand(message);
+    if (adjustInventoryCmd) {
+      const toolCall: ToolCall = {
+        tool: "adjust_inventory",
+        args: {
+          owner_id: CORE_OWNER_ID,
+          name: adjustInventoryCmd.name,
+          delta: adjustInventoryCmd.delta,
+          notes: adjustInventoryCmd.notes ?? null,
+        },
+      };
+
+      const toolResult = await dispatchTool(toolCall);
+      const ok = !!(toolResult as any)?.ok;
+      const newQty = (toolResult as any)?.data?.quantity ?? (toolResult as any)?.result?.quantity ?? null;
+
+      let reply = "";
+      if (ok) {
+        reply = `Adjusted **${adjustInventoryCmd.name}** by **${adjustInventoryCmd.delta}**. New quantity: **${newQty ?? "updated"}**.`;
+      } else {
+        const errMsg =
+          (toolResult as any)?.error ||
+          (toolResult as any)?.message ||
+          "Adjust inventory failed.";
+        reply = `I could not adjust **${adjustInventoryCmd.name}**. ${errMsg}`;
+      }
+
+      await supabase.from("chat_messages").insert({
+        thread_id,
+        role: "assistant",
+        content: reply,
+        meta: {
+          used_tool: "adjust_inventory",
+          tool_calls: [toolCall],
+          tool_results: [toolResult],
+        },
+        org_key: ORG_KEY,
+      });
+
+      return NextResponse.json({
+        thread_id,
+        reply,
+        tool_results: [toolResult],
+        fact_apply: null,
+      });
+    }
+
+    // 3D) Available puppies
     if (looksLikePuppyAvailabilityQuestion(message)) {
       try {
         const pups = await listAvailablePuppies({
@@ -356,7 +518,7 @@ export async function POST(req: Request) {
             ? "You currently have 0 puppies marked as **available**."
             : [
                 `You currently have **${count}** puppies marked as **available**:`,
-                ...pups.map((p, i) => {
+                ...pups.map((p: any, i: number) => {
                   const nm = (p.name ?? "").trim() || `Puppy ${i + 1}`;
                   const sex = (p.sex ?? "").trim();
                   const color = (p.color ?? "").trim();
@@ -400,6 +562,60 @@ export async function POST(req: Request) {
       }
     }
 
+    // 3E) List inventory
+    if (looksLikeInventoryListQuestion(message)) {
+      try {
+        const items = await listInventory({
+          supabase,
+          owner_id: CORE_OWNER_ID,
+        });
+
+        const count = items.length;
+
+        const reply =
+          count === 0
+            ? "You currently have 0 inventory items recorded."
+            : [
+                `You currently have **${count}** inventory items recorded:`,
+                ...items.slice(0, 25).map((item: any) => {
+                  return `• ${item.name} — qty ${item.quantity} — cost ${formatMoney(item.cost)}`;
+                }),
+              ].join("\n");
+
+        await supabase.from("chat_messages").insert({
+          thread_id,
+          role: "assistant",
+          content: reply,
+          meta: {
+            used_tool: "listInventory",
+            counts: { inventory: count },
+            sample_ids: items.slice(0, 10).map((i: any) => i?.id).filter(Boolean),
+          },
+          org_key: ORG_KEY,
+        });
+
+        return NextResponse.json({
+          thread_id,
+          reply,
+          tool_results: [],
+          fact_apply: null,
+        });
+      } catch (e: any) {
+        console.error("Inventory list query failed:", e);
+        const reply = "I couldn’t pull inventory right now. Try again in a moment.";
+
+        await supabase.from("chat_messages").insert({
+          thread_id,
+          role: "assistant",
+          content: reply,
+          meta: { error: e?.message ?? String(e), used_tool: "listInventory" },
+          org_key: ORG_KEY,
+        });
+
+        return NextResponse.json({ thread_id, reply }, { status: 200 });
+      }
+    }
+
     // 4) Load recent messages for memory
     const { data: recentMsgs, error: recentErr } = await supabase
       .from("chat_messages")
@@ -412,7 +628,7 @@ export async function POST(req: Request) {
 
     const anthropicMessages = toAnthropicMessages((recentMsgs ?? []) as DbMsg[]);
 
-    // 5) Optional rule-based tool calls (kept)
+    // 5) Optional rule-based tool calls
     const toolCalls: ToolCall[] = [];
     if (message.toLowerCase().startsWith("test litter")) {
       toolCalls.push({
@@ -432,7 +648,7 @@ export async function POST(req: Request) {
       tool_results.push(await dispatchTool(call));
     }
 
-    // 6) Extract facts (JSON-only) and apply safely
+    // 6) Extract facts
     let fact_apply: any = null;
     try {
       const factSystem = `
@@ -479,8 +695,12 @@ Voice:
 
 Rules:
 - Use the conversation history.
-- Do NOT invent weights, dates, prices, buyer names, or payment statuses.
+- Do NOT invent weights, dates, prices, buyer names, payment statuses, inventory counts, or system actions.
 - CRITICAL: Do NOT claim you created/updated a record unless a tool result proves it.
+- NEVER output <function_calls>, <invoke>, or <function_result> blocks.
+- Tools are executed only by the server.
+- Do not ask broad exploratory questions about inventory, payments, or operations unless those actions are wired to real tools.
+- If a requested operational action is not wired yet, say so plainly and briefly.
 
 If you successfully recorded a fact, confirm it plainly.
 If the user asked a question, answer it.
@@ -488,6 +708,7 @@ Keep it tight and useful.
 `.trim();
 
     let reply = "";
+
     try {
       const baseReply = await callAnthropicText({
         system: chatSystem,
@@ -515,7 +736,7 @@ Keep it tight and useful.
       reply = "I hit a temporary issue generating a response. Please try again.";
     }
 
-    // 8) Insert assistant reply with meta
+    // 8) Insert assistant reply
     const { error: insertAsstErr } = await supabase.from("chat_messages").insert({
       thread_id,
       role: "assistant",
