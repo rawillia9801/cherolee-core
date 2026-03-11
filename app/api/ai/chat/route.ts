@@ -45,6 +45,29 @@ type AdjustInventoryToolCall = {
 
 type RouteToolCall = ToolCall | AddInventoryToolCall | AdjustInventoryToolCall;
 
+type OperationalIntentName =
+  | "inventory_list"
+  | "inventory_add"
+  | "inventory_adjust"
+  | "puppy_add"
+  | "puppy_availability"
+  | "none";
+
+type OperationalIntent = {
+  intent: OperationalIntentName;
+  confidence: number;
+  item_name?: string | null;
+  puppy_name?: string | null;
+  quantity?: number | null;
+  cost?: number | null;
+  sku?: string | null;
+  category?: string | null;
+  supplier?: string | null;
+  sell_price?: number | null;
+  notes?: string | null;
+  delta?: number | null;
+};
+
 function getCoreOwnerId() {
   const id = process.env.CORE_OWNER_ID?.trim();
   if (!id) throw new Error("Missing env var: CORE_OWNER_ID");
@@ -150,10 +173,10 @@ async function callAnthropicJson(opts: {
     : "";
 
   try {
-    return JSON.parse(raw) as FactExtractResult;
+    return JSON.parse(raw);
   } catch {
     console.error("Failed to parse JSON from Claude:", raw);
-    return { facts: [] };
+    return null;
   }
 }
 
@@ -188,6 +211,12 @@ function looksLikeInventoryListQuestion(text: string) {
     /\bwhat do i have in inventory\b/.test(s) ||
     /\binventory list\b/.test(s) ||
     /\bshow me inventory\b/.test(s) ||
+    /\bwhat(?:'s| is)? in my inventory\b/.test(s) ||
+    /\bwhats in my inventory\b/.test(s) ||
+    /\bwhatz(?: me)? invent(?:0|o)?ry\b/.test(s) ||
+    /\bdo i have\b.*\binventory\b/.test(s) ||
+    /\bwhat have i got\b/.test(s) ||
+    /\bshow me what i got\b/.test(s) ||
     (/\bhow many\b/.test(s) && /\binventory\b/.test(s))
   );
 }
@@ -228,7 +257,7 @@ function looksLikePuppyAddCommand(text: string) {
 function parseAddPuppyCommand(text: string): { name: string } | null {
   const s = text.trim();
 
-  let m = s.match(/^\s*add\s+(?:puppy|pup)\s*:?\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,60})\s*$/i);
+  const m = s.match(/^\s*add\s+(?:puppy|pup)\s*:?\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,60})\s*$/i);
   if (m?.[1]) {
     return { name: m[1].trim() };
   }
@@ -361,6 +390,98 @@ function parseAdjustInventoryCommand(text: string): {
   return null;
 }
 
+function sanitizeOperationalIntent(raw: any): OperationalIntent {
+  if (!raw || typeof raw !== "object") {
+    return { intent: "none", confidence: 0 };
+  }
+
+  const intent = String(raw.intent ?? "none") as OperationalIntentName;
+  const confidence = Number(raw.confidence ?? 0);
+
+  return {
+    intent,
+    confidence: Number.isFinite(confidence) ? confidence : 0,
+    item_name: raw.item_name ? String(raw.item_name) : null,
+    puppy_name: raw.puppy_name ? String(raw.puppy_name) : null,
+    quantity:
+      raw.quantity === null || raw.quantity === undefined ? null : Number(raw.quantity),
+    cost: raw.cost === null || raw.cost === undefined ? null : Number(raw.cost),
+    sku: raw.sku ? String(raw.sku) : null,
+    category: raw.category ? String(raw.category) : null,
+    supplier: raw.supplier ? String(raw.supplier) : null,
+    sell_price:
+      raw.sell_price === null || raw.sell_price === undefined
+        ? null
+        : Number(raw.sell_price),
+    notes: raw.notes ? String(raw.notes) : null,
+    delta: raw.delta === null || raw.delta === undefined ? null : Number(raw.delta),
+  };
+}
+
+async function classifyOperationalIntent(message: string): Promise<OperationalIntent> {
+  try {
+    const system = `
+Return JSON ONLY.
+
+You classify the user's latest message into one of these intents:
+
+- "inventory_list"
+- "inventory_add"
+- "inventory_adjust"
+- "puppy_add"
+- "puppy_availability"
+- "none"
+
+Rules:
+- Be tolerant of typos, slang, shorthand, bad punctuation, and messy phrasing.
+- Interpret user intent semantically, not by exact keywords.
+- "inventory_list" includes requests like:
+  "what's in my inventory", "whatz me invent0ry", "show me what I got", "do I have any bubble mailers", "what inventory do i have"
+- "inventory_add" includes adding or receiving stock
+- "inventory_adjust" includes subtracting, removing, damaging, selling, restocking, or adjusting stock counts
+- "puppy_add" is only for adding an actual puppy record
+- "puppy_availability" is for asking how many puppies are available or listing available puppies
+- If unclear, use "none"
+
+Output formats:
+1) inventory_list
+{"intent":"inventory_list","confidence":0.95,"item_name":null}
+
+2) inventory_add
+{"intent":"inventory_add","confidence":0.95,"item_name":"bubble mailers","quantity":50,"cost":0.18,"sku":null,"category":null,"supplier":null,"sell_price":null,"notes":null}
+
+3) inventory_adjust
+{"intent":"inventory_adjust","confidence":0.95,"item_name":"puppy pads","delta":-2,"notes":"damaged"}
+
+4) puppy_add
+{"intent":"puppy_add","confidence":0.95,"puppy_name":"Daisy"}
+
+5) puppy_availability
+{"intent":"puppy_availability","confidence":0.95}
+
+6) none
+{"intent":"none","confidence":0.2}
+
+No commentary. JSON only.
+`.trim();
+
+    const raw = await callAnthropicJson({
+      system,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: message }],
+        },
+      ],
+    });
+
+    return sanitizeOperationalIntent(raw);
+  } catch (e) {
+    console.error("Operational intent classification failed:", e);
+    return { intent: "none", confidence: 0 };
+  }
+}
+
 async function createThreadWithFallbacks(opts: {
   supabase: any;
   owner_id: string;
@@ -474,8 +595,27 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3A) Add inventory FIRST
-    const addInventoryCmd = parseAddInventoryCommand(message);
+    const classifiedIntent = await classifyOperationalIntent(message);
+
+    const parsedAddInventory = parseAddInventoryCommand(message);
+    const aiAddInventory =
+      classifiedIntent.intent === "inventory_add" &&
+      classifiedIntent.confidence >= 0.65 &&
+      classifiedIntent.item_name
+        ? {
+            name: classifiedIntent.item_name,
+            quantity: classifiedIntent.quantity ?? 1,
+            cost: classifiedIntent.cost ?? 0,
+            sku: classifiedIntent.sku ?? null,
+            category: classifiedIntent.category ?? null,
+            supplier: classifiedIntent.supplier ?? null,
+            sell_price: classifiedIntent.sell_price ?? null,
+            notes: classifiedIntent.notes ?? null,
+          }
+        : null;
+
+    const addInventoryCmd = parsedAddInventory ?? aiAddInventory;
+
     if (addInventoryCmd) {
       const toolCall: AddInventoryToolCall = {
         tool: "add_inventory",
@@ -515,6 +655,7 @@ export async function POST(req: Request) {
           used_tool: "add_inventory",
           tool_calls: [toolCall],
           tool_results: [toolResult],
+          intent: classifiedIntent,
         },
         org_key: ORG_KEY,
       });
@@ -527,8 +668,21 @@ export async function POST(req: Request) {
       });
     }
 
-    // 3B) Adjust inventory
-    const adjustInventoryCmd = parseAdjustInventoryCommand(message);
+    const parsedAdjustInventory = parseAdjustInventoryCommand(message);
+    const aiAdjustInventory =
+      classifiedIntent.intent === "inventory_adjust" &&
+      classifiedIntent.confidence >= 0.65 &&
+      classifiedIntent.item_name &&
+      typeof classifiedIntent.delta === "number"
+        ? {
+            name: classifiedIntent.item_name,
+            delta: classifiedIntent.delta,
+            notes: classifiedIntent.notes ?? undefined,
+          }
+        : null;
+
+    const adjustInventoryCmd = parsedAdjustInventory ?? aiAdjustInventory;
+
     if (adjustInventoryCmd) {
       const toolCall: AdjustInventoryToolCall = {
         tool: "adjust_inventory",
@@ -564,6 +718,7 @@ export async function POST(req: Request) {
           used_tool: "adjust_inventory",
           tool_calls: [toolCall],
           tool_results: [toolResult],
+          intent: classifiedIntent,
         },
         org_key: ORG_KEY,
       });
@@ -576,8 +731,18 @@ export async function POST(req: Request) {
       });
     }
 
-    // 3C) Puppy add AFTER inventory
-    const addCmd = looksLikePuppyAddCommand(message) ? parseAddPuppyCommand(message) : null;
+    const parsedPuppyAdd =
+      looksLikePuppyAddCommand(message) ? parseAddPuppyCommand(message) : null;
+
+    const aiPuppyAdd =
+      classifiedIntent.intent === "puppy_add" &&
+      classifiedIntent.confidence >= 0.75 &&
+      classifiedIntent.puppy_name
+        ? { name: classifiedIntent.puppy_name }
+        : null;
+
+    const addCmd = parsedPuppyAdd ?? aiPuppyAdd;
+
     if (addCmd) {
       const toolCall: ToolCall = {
         tool: "create_puppy",
@@ -614,6 +779,7 @@ export async function POST(req: Request) {
           tool_calls: [toolCall],
           tool_results: [toolResult],
           proof: { ok, puppyId },
+          intent: classifiedIntent,
         },
         org_key: ORG_KEY,
       });
@@ -626,8 +792,11 @@ export async function POST(req: Request) {
       });
     }
 
-    // 3D) Available puppies
-    if (looksLikePuppyAvailabilityQuestion(message)) {
+    const shouldListPuppies =
+      looksLikePuppyAvailabilityQuestion(message) ||
+      (classifiedIntent.intent === "puppy_availability" && classifiedIntent.confidence >= 0.65);
+
+    if (shouldListPuppies) {
       try {
         const pups = await listAvailablePuppies({
           supabase,
@@ -660,6 +829,7 @@ export async function POST(req: Request) {
             used_tool: "listAvailablePuppies",
             counts: { available: count },
             sample_ids: pups.slice(0, 10).map((p: any) => p?.id).filter(Boolean),
+            intent: classifiedIntent,
           },
           org_key: ORG_KEY,
         });
@@ -678,7 +848,11 @@ export async function POST(req: Request) {
           thread_id,
           role: "assistant",
           content: reply,
-          meta: { error: e?.message ?? String(e), used_tool: "listAvailablePuppies" },
+          meta: {
+            error: e?.message ?? String(e),
+            used_tool: "listAvailablePuppies",
+            intent: classifiedIntent,
+          },
           org_key: ORG_KEY,
         });
 
@@ -686,22 +860,40 @@ export async function POST(req: Request) {
       }
     }
 
-    // 3E) List inventory
-    if (looksLikeInventoryListQuestion(message)) {
+    const shouldListInventory =
+      looksLikeInventoryListQuestion(message) ||
+      (classifiedIntent.intent === "inventory_list" && classifiedIntent.confidence >= 0.55);
+
+    if (shouldListInventory) {
       try {
         const items = await listInventory({
           supabase,
           owner_id: CORE_OWNER_ID,
         });
 
-        const count = items.length;
+        const normalizedNeedle =
+          classifiedIntent.intent === "inventory_list" && classifiedIntent.item_name
+            ? classifiedIntent.item_name.trim().toLowerCase()
+            : null;
+
+        const filteredItems = normalizedNeedle
+          ? items.filter((item: any) =>
+              String(item?.name ?? "").toLowerCase().includes(normalizedNeedle)
+            )
+          : items;
+
+        const targetCount = filteredItems.length;
 
         const reply =
-          count === 0
-            ? "You currently have 0 inventory items recorded."
+          targetCount === 0
+            ? normalizedNeedle
+              ? `I don’t see any inventory items matching **${classifiedIntent.item_name}** right now.`
+              : "You currently have 0 inventory items recorded."
             : [
-                `You currently have **${count}** inventory items recorded:`,
-                ...items.slice(0, 25).map((item: any) => {
+                normalizedNeedle
+                  ? `I found **${targetCount}** inventory item(s) matching **${classifiedIntent.item_name}**:`
+                  : `You currently have **${targetCount}** inventory items recorded:`,
+                ...filteredItems.slice(0, 25).map((item: any) => {
                   return `• ${item.name} — qty ${item.quantity} — cost ${formatMoney(item.cost)}`;
                 }),
               ].join("\n");
@@ -712,8 +904,9 @@ export async function POST(req: Request) {
           content: reply,
           meta: {
             used_tool: "listInventory",
-            counts: { inventory: count },
-            sample_ids: items.slice(0, 10).map((i: any) => i?.id).filter(Boolean),
+            counts: { inventory: targetCount },
+            sample_ids: filteredItems.slice(0, 10).map((i: any) => i?.id).filter(Boolean),
+            intent: classifiedIntent,
           },
           org_key: ORG_KEY,
         });
@@ -732,7 +925,11 @@ export async function POST(req: Request) {
           thread_id,
           role: "assistant",
           content: reply,
-          meta: { error: e?.message ?? String(e), used_tool: "listInventory" },
+          meta: {
+            error: e?.message ?? String(e),
+            used_tool: "listInventory",
+            intent: classifiedIntent,
+          },
           org_key: ORG_KEY,
         });
 
@@ -795,10 +992,10 @@ JSON shape:
 {"facts":[...]}
 `.trim();
 
-      const extracted = await callAnthropicJson({
+      const extracted = (await callAnthropicJson({
         system: factSystem,
         messages: anthropicMessages,
-      });
+      })) as FactExtractResult | null;
 
       fact_apply = await applyFactsSafely(thread_id, extracted?.facts ?? []);
     } catch (e: any) {
@@ -860,7 +1057,7 @@ Keep it tight and useful.
       thread_id,
       role: "assistant",
       content: reply,
-      meta: { tool_results, fact_apply },
+      meta: { tool_results, fact_apply, intent: classifiedIntent },
       org_key: ORG_KEY,
     });
 
